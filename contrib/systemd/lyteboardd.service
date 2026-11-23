@@ -1,0 +1,12 @@
+[Unit]
+Description=Lyteboard local daemon
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/lyteboardd
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+[Install]
+WantedBy=default.target

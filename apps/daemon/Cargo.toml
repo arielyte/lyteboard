@@ -1,0 +1,29 @@
+[package]
+name = "lyteboard-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lyteboardd"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+lyteboard-core.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lyteboard-protocol.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["io-util"] }

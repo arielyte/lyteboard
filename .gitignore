@@ -1,0 +1,43 @@
+# Rust and Tauri
+/target/
+/apps/desktop/src-tauri/gen/
+
+# Node.js
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+
+# Android and Gradle
+.gradle/
+.kotlin/
+.idea/
+*.iml
+local.properties
+build/
+.cxx/
+captures/
+*.apk
+*.aab
+
+# Local secrets and application data
+.env
+.env.*
+!.env.example
+.aws/
+secrets/
+id_ed25519
+id_rsa
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

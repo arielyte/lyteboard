@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Daemon status for the local Lyteboard window.",
+  "windows": ["main"],
+  "permissions": ["allow-daemon-status"]
+}

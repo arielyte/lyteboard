@@ -1,0 +1,21 @@
+[package]
+name = "lyteboard-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.7.6", features = [] }
+
+[dependencies]
+lyteboard-core.workspace = true
+tauri = { version = "2.12.7", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]

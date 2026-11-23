@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "apps/cli",
+    "apps/daemon",
+    "apps/desktop/src-tauri",
+    "crates/core",
+    "crates/protocol",
+    "services/relay",
+]
+default-members = [
+    "apps/cli",
+    "apps/daemon",
+    "crates/core",
+    "crates/protocol",
+    "services/relay",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/arielyte/lyteboard"
+publish = false
+
+[workspace.dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4.6", features = ["derive"] }
+lyteboard-core = { path = "crates/core" }
+lyteboard-protocol = { path = "crates/protocol" }
+rustix = { version = "1.1", features = ["process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt", "signal"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
