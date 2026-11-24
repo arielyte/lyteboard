@@ -47,12 +47,16 @@ enum Command {
         #[command(subcommand)]
         command: network::DeviceCommand,
     },
-    /// Send short test text and wait for an authenticated receipt.
+    /// Send text and wait for an authenticated receipt.
     #[cfg(target_os = "linux")]
     Send {
         #[arg(value_parser = network::parse_key)]
         device: [u8; 32],
-        text: String,
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        text: Option<String>,
+        /// Read UTF-8 text from standard input, up to 1 MiB.
+        #[arg(long)]
+        stdin: bool,
     },
     /// Send or apply text from the Linux clipboard.
     #[cfg(target_os = "linux")]

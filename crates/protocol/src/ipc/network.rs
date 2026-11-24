@@ -4,32 +4,70 @@ use std::{fmt, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::peer::NoiseKey;
+use crate::peer::{Media, NoiseKey};
 
 pub const MAX_TEST_TEXT_BYTES: usize = 512;
 pub const DEVICES_PER_PAGE: usize = 4;
+pub const MAX_RECIPIENTS: usize = 32;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     Status,
-    Listen { address: SocketAddr },
-    Discover { offset: usize },
-    SetDiscovery { enabled: bool },
-    SetAddress { peer: NoiseKey, address: SocketAddr },
+    Listen {
+        address: SocketAddr,
+    },
+    Discover {
+        offset: usize,
+    },
+    SetDiscovery {
+        enabled: bool,
+    },
+    SetAddress {
+        peer: NoiseKey,
+        address: SocketAddr,
+    },
     Invite,
-    Accept { qr: String },
+    Accept {
+        qr: String,
+    },
     PairStatus,
-    Confirm { code: String },
+    Confirm {
+        code: String,
+    },
     CancelPair,
-    Devices { offset: usize },
-    Rename { peer: NoiseKey, name: String },
-    Remove { peer: NoiseKey },
-    Send { peer: NoiseKey, text: String },
-    Delivery { id: u64 },
-    Received { offset: usize },
+    Devices {
+        offset: usize,
+    },
+    Rename {
+        peer: NoiseKey,
+        name: String,
+    },
+    Remove {
+        peer: NoiseKey,
+    },
+    Send {
+        peer: NoiseKey,
+        text: String,
+    },
+    Delivery {
+        id: u64,
+    },
+    BulkUpload {
+        peers: Vec<String>,
+        media: Media,
+        size: u32,
+    },
+    BulkDownload {
+        offset: usize,
+    },
+    Received {
+        offset: usize,
+    },
     ClipboardAutoStatus,
-    SetClipboardAuto { enabled: bool },
+    SetClipboardAuto {
+        enabled: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +91,13 @@ pub enum Reply {
         more: bool,
     },
     Queued(u64),
+    BulkReady,
+    BulkQueued(Vec<QueueOutcome>),
+    BulkItem {
+        media: Media,
+        size: u32,
+    },
+    NoBulkItem,
     Delivery(Delivery),
     Received(Option<Message>),
     ClipboardAuto {
@@ -71,6 +116,13 @@ impl fmt::Debug for Reply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("NetworkReply([redacted])")
     }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueueOutcome {
+    Queued(u64),
+    Error(String),
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +232,18 @@ mod tests {
         let auto_frame = encode(&auto).unwrap();
         assert!(auto_frame.len() < MAX_FRAME_BYTES);
         assert_eq!(decode::<Request>(&auto_frame).unwrap(), auto);
+        let upload = Request::Network(Command::BulkUpload {
+            peers: vec!["ff".repeat(32); MAX_RECIPIENTS],
+            media: Media::Webp,
+            size: crate::peer::MAX_IMAGE_BYTES as u32,
+        });
+        assert!(encode(&upload).unwrap().len() <= MAX_FRAME_BYTES);
+        let report = Response::Network(Reply::BulkQueued(
+            (0..MAX_RECIPIENTS)
+                .map(|_| QueueOutcome::Error(char::from(92).to_string().repeat(48)))
+                .collect(),
+        ));
+        assert!(encode(&report).unwrap().len() <= MAX_FRAME_BYTES);
         let qr = Request::Network(Command::Accept {
             qr: "private-qr".into(),
         });

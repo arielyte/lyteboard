@@ -1,19 +1,25 @@
-use std::{collections::BTreeMap, net::SocketAddr, rc::Rc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
 
-use lyteboard_core::peer::{Endpoint, SessionEvent, TrustedDevice, lan};
+use lyteboard_core::{
+    bulk::Payload,
+    peer::{Endpoint, SessionEvent, TrustedDevice, lan},
+};
 use lyteboard_protocol::{
-    ipc::network::{ConnectionState, Delivery, MAX_TEST_TEXT_BYTES, Message},
-    peer::{NoiseKey, PeerFailure},
+    ipc::network::{ConnectionState, Delivery, MAX_TEST_TEXT_BYTES},
+    peer::{BulkRecord, NoiseKey, PeerFailure, TransferId},
 };
 use tokio::{
     sync::{mpsc, oneshot},
     task::spawn_local,
-    time::{Instant, sleep_until},
+    time::{Instant, sleep_until, timeout_at},
 };
 
-use super::{Activity, Shared, lan_error, peer_error};
+use super::{
+    Activity, Shared,
+    bulk::{Batch, Incoming, Outgoing, PROGRESS_TIMEOUT},
+    lan_error, peer_error,
+};
 
-const INBOX_LIMIT: usize = 16;
 const DELIVERY_LIMIT: usize = 64;
 const MAX_DIALING: usize = 4;
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,7 +50,40 @@ struct Mailbox {
 
 struct Job {
     id: u64,
-    text: String,
+    content: Content,
+}
+
+enum Content {
+    Text(String),
+    Bulk(Arc<Batch>),
+}
+
+enum Pending {
+    Ack {
+        id: TransferId,
+        job: u64,
+        deadline: Instant,
+    },
+    Bulk(Outgoing),
+}
+
+impl Pending {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Ack { deadline, .. } => *deadline,
+            Self::Bulk(transfer) => transfer.deadline(),
+        }
+    }
+
+    fn job_for(&self, id: TransferId) -> Option<u64> {
+        match self {
+            Self::Ack {
+                id: expected, job, ..
+            } if *expected == id => Some(*job),
+            Self::Bulk(transfer) if transfer.id == id => Some(transfer.job),
+            _ => None,
+        }
+    }
 }
 
 struct Transfer {
@@ -220,7 +259,7 @@ impl Sessions {
     }
 }
 
-pub(super) fn queue(
+pub(super) fn queue_text(
     activity: &Shared,
     endpoint: Rc<Endpoint>,
     peer: NoiseKey,
@@ -231,6 +270,24 @@ pub(super) fn queue(
             "Text must be 1–{MAX_TEST_TEXT_BYTES} UTF-8 bytes without NUL."
         ));
     }
+    queue(activity, endpoint, peer, Content::Text(text))
+}
+
+pub(super) fn queue_bulk(
+    activity: &Shared,
+    endpoint: Rc<Endpoint>,
+    peer: NoiseKey,
+    batch: Arc<Batch>,
+) -> Result<u64, String> {
+    queue(activity, endpoint, peer, Content::Bulk(batch))
+}
+
+fn queue(
+    activity: &Shared,
+    endpoint: Rc<Endpoint>,
+    peer: NoiseKey,
+    content: Content,
+) -> Result<u64, String> {
     let device = endpoint
         .trusted_devices()
         .map_err(peer_error)?
@@ -253,7 +310,7 @@ pub(super) fn queue(
         .expect("an existing channel was found or a dial was registered");
     channel
         .jobs
-        .try_send(Job { id, text })
+        .try_send(Job { id, content })
         .map_err(|_| "Peer connection is busy or closed.")?;
     sessions.deliveries.insert(
         id,
@@ -379,55 +436,173 @@ async fn run_channel(
 ) -> Result<(), String> {
     let peer = session.peer_key();
     let expires = Instant::now() + SESSION_LIFETIME;
-    let mut pending = None;
+    let mut pending: Option<Pending> = None;
+    let mut incoming: Option<Incoming> = None;
     loop {
-        let deadline = pending.map_or(expires, |(_, _, deadline): (_, _, Instant)| {
-            deadline.min(expires)
-        });
+        let deadline = expires
+            .min(pending.as_ref().map_or(expires, Pending::deadline))
+            .min(incoming.as_ref().map_or(expires, Incoming::deadline));
         tokio::select! {
-            _ = sleep_until(deadline) => return Err(
-                if pending.is_some() { "Delivery acknowledgment timed out." } else { "Session expired." }.into()
-            ),
+            biased;
+            _ = sleep_until(deadline) => return Err("Transfer or session timed out.".into()),
             job = jobs.recv(), if pending.is_none() => {
                 let Some(job) = job else { return Ok(()) };
-                let id = session.send_text(&job.text).await.map_err(lan_error)?;
-                pending = Some((id, job.id, Instant::now() + ACK_TIMEOUT));
+                pending = Some(start_transfer(&mut session, job).await?);
             }
             readable = session.wait_for_input() => {
                 readable.map_err(lan_error)?;
-                match session.receive().await.map_err(lan_error)? {
+                let event = timeout_at(deadline, session.receive()).await
+                    .map_err(|_| "Transfer timed out.")?.map_err(lan_error)?;
+                match event {
                     SessionEvent::Text { id, text } => {
                         if text.len() > MAX_TEST_TEXT_BYTES {
-                            session.reject_text(id, PeerFailure::TooLarge).await.map_err(lan_error)?;
+                            session.reject_payload(id, PeerFailure::TooLarge).await.map_err(lan_error)?;
                         } else {
-                            {
-                                let mut state = activity.borrow_mut();
-                                if state.inbox.len() == INBOX_LIMIT {
-                                    state.inbox.pop_back();
-                                }
-                                state.clipboard.received(&text);
-                                state.inbox.push_front(Message { peer, text });
-                            }
+                            let payload = Payload::text(text).map_err(|error| error.to_string())?;
+                            publish(activity, peer, payload);
                             session.acknowledge(id).await.map_err(lan_error)?;
                         }
                     }
+                    SessionEvent::Bulk(BulkRecord::Credit { id, next }) => {
+                        let Some(Pending::Bulk(transfer)) = &mut pending else {
+                            return Err("Unexpected bulk credit.".into());
+                        };
+                        let record = transfer.credit(id, next).map_err(|error| error.to_string())?;
+                        if matches!(record, BulkRecord::End { .. }) {
+                            pending = Some(Pending::Ack {
+                                id, job: transfer.job, deadline: transfer.expires.min(Instant::now() + ACK_TIMEOUT),
+                            });
+                        }
+                        session.send_bulk(record).await.map_err(lan_error)?;
+                    }
+                    SessionEvent::Bulk(record) => handle_bulk(activity, &mut session, &mut incoming, record).await?,
                     SessionEvent::DeliveryAck { id, .. } => {
-                        let Some((_, job, _)) = pending.take().filter(|(expected, _, _)| *expected == id) else {
+                        let Some(Pending::Ack { id: expected, job, .. }) = pending.take() else {
                             return Err("Unexpected delivery acknowledgment.".into());
                         };
+                        if expected != id {
+                            return Err("Unexpected delivery acknowledgment.".into());
+                        }
                         activity.borrow_mut().sessions.acknowledge(job, Delivery::Delivered);
                     }
-                    SessionEvent::PeerError { id, .. } => {
-                        let Some((_, job, _)) = pending.take().filter(|(expected, _, _)| Some(*expected) == id) else {
+                    SessionEvent::PeerError { id, code } => {
+                        let Some(job) = pending.as_ref().and_then(|transfer| transfer.job_for(id?)) else {
                             return Err("Unexpected peer error.".into());
                         };
-                        activity.borrow_mut().sessions.acknowledge(job, Delivery::Failed("Peer rejected the text.".into()));
+                        pending = None;
+                        activity.borrow_mut().sessions.acknowledge(job, Delivery::Failed(failure_message(code).into()));
                     }
                     SessionEvent::Closed => return Ok(()),
                     _ => return Err("Unexpected peer record.".into()),
                 }
             }
         }
+    }
+}
+
+async fn start_transfer(session: &mut lan::TcpSession<'_>, job: Job) -> Result<Pending, String> {
+    match job.content {
+        Content::Text(text) => {
+            let id = session.send_text(&text).await.map_err(lan_error)?;
+            Ok(Pending::Ack {
+                id,
+                job: job.id,
+                deadline: Instant::now() + ACK_TIMEOUT,
+            })
+        }
+        Content::Bulk(batch) => {
+            let id = lan::TcpSession::transfer_id().map_err(lan_error)?;
+            let transfer = Outgoing::new(id, job.id, batch);
+            session
+                .send_bulk(BulkRecord::Begin(transfer.manifest()))
+                .await
+                .map_err(lan_error)?;
+            Ok(Pending::Bulk(transfer))
+        }
+    }
+}
+
+async fn handle_bulk(
+    activity: &Shared,
+    session: &mut lan::TcpSession<'_>,
+    incoming: &mut Option<Incoming>,
+    record: BulkRecord,
+) -> Result<(), String> {
+    match record {
+        BulkRecord::Begin(manifest) => {
+            let slot = activity.borrow().incoming_bulk.clone().try_acquire_owned();
+            match slot {
+                Ok(slot) if incoming.is_none() => match Incoming::new(manifest, slot) {
+                    Ok(transfer) => {
+                        *incoming = Some(transfer);
+                        session
+                            .send_bulk(BulkRecord::Credit {
+                                id: manifest.id,
+                                next: 0,
+                            })
+                            .await
+                            .map_err(lan_error)
+                    }
+                    Err(error) => session
+                        .reject_payload(manifest.id, error.peer_failure())
+                        .await
+                        .map_err(lan_error),
+                },
+                _ => session
+                    .reject_payload(manifest.id, PeerFailure::Busy)
+                    .await
+                    .map_err(lan_error),
+            }
+        }
+        BulkRecord::Chunk { id, index, bytes } => {
+            let transfer = incoming.as_mut().ok_or("Unexpected bulk chunk.")?;
+            let next = transfer
+                .chunk(id, index, &bytes)
+                .map_err(|error| error.to_string())?;
+            session
+                .send_bulk(BulkRecord::Credit { id, next })
+                .await
+                .map_err(lan_error)
+        }
+        BulkRecord::End { id } => {
+            let transfer = incoming.take().ok_or("Unexpected bulk end.")?;
+            let deadline = transfer.deadline().min(Instant::now() + PROGRESS_TIMEOUT);
+            match timeout_at(deadline, transfer.finish(id)).await {
+                Ok(Ok(payload)) => {
+                    // Image validation yields to the worker. Recheck the lease before publishing.
+                    session.ensure_active().map_err(lan_error)?;
+                    publish(activity, session.peer_key(), payload);
+                    session.acknowledge(id).await.map_err(lan_error)?;
+                    Ok(())
+                }
+                Ok(Err(error)) => session
+                    .reject_payload(id, error.peer_failure())
+                    .await
+                    .map_err(lan_error),
+                Err(_) => Err("Bulk validation timed out.".into()),
+            }
+        }
+        BulkRecord::Credit { .. } => Err("Unexpected bulk credit.".into()),
+    }
+}
+
+fn publish(activity: &Shared, peer: NoiseKey, payload: Payload) {
+    let mut state = activity.borrow_mut();
+    if let Some(text) = payload.as_text() {
+        state.clipboard.received(text);
+    }
+    state.inbox.push(peer, payload);
+}
+
+fn failure_message(code: PeerFailure) -> &'static str {
+    match code {
+        PeerFailure::TooLarge => "Peer rejected the payload size or image dimensions.",
+        PeerFailure::InvalidPayload => "Peer rejected the payload format.",
+        PeerFailure::IntegrityFailed => "Peer rejected the payload digest.",
+        PeerFailure::UnsupportedMedia => "Peer does not support this media.",
+        PeerFailure::Busy => "Peer bulk receiving is busy.",
+        PeerFailure::TimedOut => "Peer transfer timed out.",
+        PeerFailure::Denied => "Peer denied the transfer.",
     }
 }
 

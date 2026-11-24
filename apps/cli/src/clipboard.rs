@@ -5,19 +5,19 @@ use lyteboard_core::{
     clipboard::Clipboard,
     ipc::{
         Client,
-        network::{Command as Request, Delivery, MAX_TEST_TEXT_BYTES, Reply},
+        network::{Command as Request, Delivery, MAX_RECIPIENTS, QueueOutcome, Reply},
     },
 };
 use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::{
     linux::CommandError,
-    network::{parse_key, queue_text, request, unexpected},
+    network::{parse_key, request, unexpected},
 };
 
 #[derive(Subcommand)]
 pub enum ClipboardCommand {
-    /// Send the current clipboard text to one or more paired devices.
+    /// Send the current clipboard text or image to one or more paired devices.
     Send {
         #[arg(required = true, value_parser = parse_key)]
         devices: Vec<[u8; 32]>,
@@ -46,23 +46,24 @@ pub async fn run(client: &Client, command: ClipboardCommand) -> Result<(), Comma
         ClipboardCommand::Send { devices } => send_clipboard(client, devices).await,
         ClipboardCommand::Copy { index } => {
             let clipboard = Clipboard::for_session().map_err(clipboard_error)?;
-            let reply = request(
-                client,
-                Request::Received {
-                    offset: usize::from(index - 1),
-                },
-            )
-            .await?;
-            let Reply::Received(message) = reply else {
-                return Err(unexpected());
-            };
-            let message = message
-                .ok_or_else(|| CommandError::Network("No received text at that index.".into()))?;
+            let (media, bytes) = client
+                .download_bulk(usize::from(index - 1))
+                .await?
+                .ok_or_else(|| {
+                    CommandError::Network("No received content at that index.".into())
+                })?;
             clipboard
-                .write_text(&message.text, MAX_TEST_TEXT_BYTES)
+                .write_content(media, &bytes)
                 .await
                 .map_err(clipboard_error)?;
-            println!("Copied received text");
+            println!(
+                "Copied received {}",
+                if media == lyteboard_core::bulk::Media::Text {
+                    "text"
+                } else {
+                    "image"
+                }
+            );
             Ok(())
         }
         ClipboardCommand::Auto { mode } => {
@@ -97,29 +98,31 @@ pub async fn run(client: &Client, command: ClipboardCommand) -> Result<(), Comma
 async fn send_clipboard(client: &Client, mut peers: Vec<[u8; 32]>) -> Result<(), CommandError> {
     let mut seen = HashSet::new();
     peers.retain(|peer| seen.insert(*peer));
-    if peers.len() > 32 {
+    if peers.len() > MAX_RECIPIENTS {
         return Err(CommandError::Network(
             "Select at most 32 paired devices.".into(),
         ));
     }
 
     let clipboard = Clipboard::for_session().map_err(clipboard_error)?;
-    let text = clipboard
-        .read_text(MAX_TEST_TEXT_BYTES)
-        .await
-        .map_err(clipboard_error)?;
+    let (media, bytes) = clipboard.read_content().await.map_err(clipboard_error)?;
     let total = peers.len();
+    let keys = peers.iter().map(hex::encode).collect();
+    let outcomes = client.upload_bulk(keys, media, &bytes).await?;
+    if outcomes.len() != total {
+        return Err(unexpected());
+    }
     let mut delivered = 0;
     let mut pending = Vec::new();
-    for peer in peers {
-        match queue_text(client, peer, text.to_string()).await {
-            Ok(id) => pending.push((peer, id)),
-            Err(error) => eprintln!("{}: {error}", hex::encode(peer)),
+    for (peer, outcome) in peers.into_iter().zip(outcomes) {
+        match outcome {
+            QueueOutcome::Queued(id) => pending.push((peer, id)),
+            QueueOutcome::Error(error) => eprintln!("{}: {error}", hex::encode(peer)),
         }
     }
-    drop(text);
+    drop(bytes);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(75);
     while !pending.is_empty() && Instant::now() < deadline {
         let mut next = Vec::new();
         for (peer, id) in pending {

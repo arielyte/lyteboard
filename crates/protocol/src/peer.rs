@@ -1,5 +1,6 @@
 //! Deterministic v1 encodings used by pairing and authenticated peer sessions.
 
+mod bulk;
 mod cbor;
 mod frame;
 mod invite;
@@ -9,6 +10,9 @@ use std::fmt;
 use minicbor::Encoder;
 use thiserror::Error;
 
+pub use bulk::{
+    BulkRecord, CHUNK_BYTES, MAX_BULK_TEXT_BYTES, MAX_IMAGE_BYTES, Manifest, Media, TransferId,
+};
 use cbor::Reader;
 pub use frame::{FrameKind, RoutedFrame};
 pub use invite::{Invite, LanInvite, QrCode, validate_lan_address};
@@ -224,6 +228,7 @@ pub enum Record {
         id: [u8; 16],
         text: String,
     },
+    Bulk(BulkRecord),
     DeliveryAck {
         id: [u8; 16],
         duplicate: bool,
@@ -277,6 +282,20 @@ impl Record {
                 validate_text(text)?;
                 4
             }
+            Self::Bulk(bulk) => match bulk {
+                BulkRecord::Begin(_) => 6,
+                BulkRecord::Credit { .. } => 4,
+                BulkRecord::Chunk { bytes, .. } => {
+                    if bytes.is_empty() {
+                        return Err(WireError::Malformed);
+                    }
+                    if bytes.len() > CHUNK_BYTES {
+                        return Err(WireError::TooLarge);
+                    }
+                    5
+                }
+                BulkRecord::End { .. } => 3,
+            },
             Self::DeliveryAck { .. } | Self::PeerError { .. } => 4,
             _ => 2,
         };
@@ -297,6 +316,32 @@ impl Record {
             Self::Text { id, text } => {
                 encoder.bytes(id).unwrap().str(text).unwrap();
             }
+            Self::Bulk(BulkRecord::Begin(manifest)) => {
+                encoder
+                    .bytes(&manifest.id)
+                    .unwrap()
+                    .u8(manifest.media as u8)
+                    .unwrap()
+                    .u32(manifest.size)
+                    .unwrap()
+                    .bytes(&manifest.digest)
+                    .unwrap();
+            }
+            Self::Bulk(BulkRecord::Credit { id, next }) => {
+                encoder.bytes(id).unwrap().u32(*next).unwrap();
+            }
+            Self::Bulk(BulkRecord::Chunk { id, index, bytes }) => {
+                encoder
+                    .bytes(id)
+                    .unwrap()
+                    .u32(*index)
+                    .unwrap()
+                    .bytes(bytes)
+                    .unwrap();
+            }
+            Self::Bulk(BulkRecord::End { id }) => {
+                encoder.bytes(id).unwrap();
+            }
             Self::DeliveryAck { id, duplicate } => {
                 encoder.bytes(id).unwrap().u8(u8::from(*duplicate)).unwrap();
             }
@@ -312,7 +357,7 @@ impl Record {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         let mut reader = Reader::new(bytes, MAX_CIPHERTEXT_BYTES - NOISE_TAG_BYTES)?;
         let len = reader.array()?;
-        if !matches!(len, 2..=4) {
+        if !matches!(len, 2..=6) {
             return Err(WireError::Malformed);
         }
         reader.version()?;
@@ -350,6 +395,32 @@ impl Record {
                     text: text.to_owned(),
                 });
             }
+            (6, 8) => Self::Bulk(BulkRecord::Begin(Manifest {
+                id: *reader.fixed()?,
+                media: Media::from_tag(reader.uint()?)?,
+                size: read_u32(&mut reader)?,
+                digest: *reader.fixed()?,
+            })),
+            (4, 9) => Self::Bulk(BulkRecord::Credit {
+                id: *reader.fixed()?,
+                next: read_u32(&mut reader)?,
+            }),
+            (5, 10) => {
+                let id = *reader.fixed()?;
+                let index = read_u32(&mut reader)?;
+                let bytes = reader.bytes(CHUNK_BYTES)?;
+                if bytes.is_empty() {
+                    return Err(WireError::Malformed);
+                }
+                Self::Bulk(BulkRecord::Chunk {
+                    id,
+                    index,
+                    bytes: zeroize::Zeroizing::new(bytes.to_vec()),
+                })
+            }
+            (3, 11) => Self::Bulk(BulkRecord::End {
+                id: *reader.fixed()?,
+            }),
             (4, 12) => Self::DeliveryAck {
                 id: *reader.fixed()?,
                 duplicate: match reader.uint()? {
@@ -379,11 +450,21 @@ impl Record {
             Self::PairReject => 5,
             Self::Ready => 6,
             Self::Text { .. } => 7,
+            Self::Bulk(bulk) => match bulk {
+                BulkRecord::Begin(_) => 8,
+                BulkRecord::Credit { .. } => 9,
+                BulkRecord::Chunk { .. } => 10,
+                BulkRecord::End { .. } => 11,
+            },
             Self::DeliveryAck { .. } => 12,
             Self::PeerError { .. } => 13,
             Self::Close => 14,
         }
     }
+}
+
+fn read_u32(reader: &mut Reader<'_>) -> Result<u32, WireError> {
+    u32::try_from(reader.uint()?).map_err(|_| WireError::Malformed)
 }
 
 impl fmt::Debug for Record {

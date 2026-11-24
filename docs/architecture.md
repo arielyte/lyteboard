@@ -28,7 +28,7 @@ flowchart LR
 | Device trust (`crates/core`) | Peer records, local approval, revocation, and lookup by pinned identity. The daemon owns the records on desktop. |
 | Networking | Open one ordered TCP stream per peer session. Bound connection admission, frame lengths, and deadlines. |
 | Synchronization (`crates/core`) | Explicit selection of recipients, opt-in automatic capture, reconnect backoff, duplicate suppression, and clipboard loop prevention. |
-| Clipboard adapters | Linux uses wl-clipboard on Wayland and xclip on X11 for text. Windows and Android adapters remain planned. |
+| Clipboard adapters | Linux uses wl-clipboard on Wayland and xclip on X11 for text and supported image targets. Windows and Android adapters remain planned. |
 | Storage | Linux profiles keep trust metadata in a private versioned snapshot and identity seeds in Secret Service. Optional history storage and daemon ownership are planned. |
 | User interfaces (`apps/`) | CLI and GUI present status and request operations from the daemon. Kotlin presents Android actions and passes input through the FFI boundary. |
 
@@ -57,4 +57,5 @@ Prefer event-driven clipboard notifications where supported, idle waits, and bou
 | **LAN-2B · Daemon and CLI** | Load the durable profile in the daemon. Expose pairing, trust management, and acknowledged test text through local CLI commands. Verify independent daemon processes over TCP. |
 | **LAN-3 · Discovery and reconnection** | Browse and advertise on the local network, accept manual on-link address hints, and reconnect to active pins with bounded backoff. Verify Noise authentication, duplicate handling, and withdrawal on shutdown. |
 | **LAN-4A · Linux clipboard text** | Send one explicitly read clipboard snapshot to selected peers. Apply received text locally on request or with opt-in auto-apply. |
-| **Later · Clipboard** | Add bounded image streaming and private local history. |
+| **LAN-4B · Bulk clipboard data** | Validate and exchange larger text and static images over bounded encrypted chunks. Preserve the 4 KiB IPC control frame. |
+| **Later · Clipboard** | Add private local history. |

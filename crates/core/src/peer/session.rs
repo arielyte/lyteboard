@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use lyteboard_protocol::peer::{
-    FrameKind, MAX_TEXT_BYTES, Path, PeerFailure, Record, RouteId, RoutedFrame,
+    BulkRecord, FrameKind, MAX_TEXT_BYTES, Path, PeerFailure, Record, RouteId, RoutedFrame,
 };
 use zeroize::Zeroizing;
 
@@ -142,6 +142,7 @@ pub enum SessionEvent {
         id: [u8; 16],
         text: String,
     },
+    Bulk(BulkRecord),
     DeliveryAck {
         id: [u8; 16],
         duplicate: bool,
@@ -242,6 +243,9 @@ impl Session<'_> {
                 let record = Record::decode(&transport.open(&frame.body)?)?;
                 let event = match record {
                     Record::Text { id, text } => SessionEvent::Text { id, text },
+                    Record::Bulk(record) if self.context.path == Path::DirectTcp => {
+                        SessionEvent::Bulk(record)
+                    }
                     Record::DeliveryAck { id, duplicate } => {
                         SessionEvent::DeliveryAck { id, duplicate }
                     }
@@ -270,6 +274,13 @@ impl Session<'_> {
             },
             now,
         )
+    }
+
+    pub fn send_bulk(&mut self, record: BulkRecord, now: Time) -> Result<RoutedFrame, Error> {
+        if self.context.path != Path::DirectTcp {
+            return Err(Error::Unexpected);
+        }
+        self.send(Record::Bulk(record), now)
     }
 
     pub fn acknowledge(
@@ -319,6 +330,12 @@ impl Session<'_> {
             self.abort();
         }
         result
+    }
+
+    pub(super) fn ensure_active(&self, now: Time) -> Result<(), Error> {
+        let lease = self.lease.as_ref().ok_or(Error::Closed)?;
+        let state = lease.endpoint.state()?;
+        self.check(&state, now).map(|_| ())
     }
 
     fn check(&self, state: &State, now: Time) -> Result<[u8; 32], Error> {

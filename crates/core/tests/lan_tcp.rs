@@ -368,3 +368,113 @@ async fn oversized_text_disconnect_and_cancel_release_channels() {
     let (mut outgoing, mut incoming) = session(&mut listener, &inviter, &scanner).await;
     exchange(&mut outgoing, &mut incoming, "connected with fresh keys").await;
 }
+
+#[tokio::test]
+async fn tampered_bulk_chunk_never_reaches_the_application() {
+    use lyteboard_core::bulk::Payload;
+    use lyteboard_protocol::peer::{BulkRecord, CHUNK_BYTES};
+
+    let (mut listener, inviter, scanner) = paired().await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = proxy.local_addr().unwrap();
+    let origin = listener.local_addr().unwrap();
+    let id = [3; 16];
+    let attack = async {
+        let (mut client, _) = proxy.accept().await.unwrap();
+        let mut server = TcpStream::connect(origin).await.unwrap();
+        // Handshake, mutual readiness, then the encrypted manifest and first credit.
+        for _ in 0..3 {
+            write_raw(&mut server, &read_raw(&mut client).await).await;
+            write_raw(&mut client, &read_raw(&mut server).await).await;
+        }
+        let (from, mut frame) =
+            RoutedFrame::decode_forwarded(&read_raw(&mut client).await).unwrap();
+        frame.body[100] ^= 1;
+        write_raw(&mut server, &frame.encode_forwarded(&from).unwrap()).await;
+    };
+    let sender = async {
+        let mut session = lan::connect_session(&scanner, address, inviter.noise_key())
+            .await
+            .unwrap();
+        let payload = Payload::text("a".repeat(CHUNK_BYTES)).unwrap();
+        session
+            .send_bulk(BulkRecord::Begin(payload.manifest(id)))
+            .await
+            .unwrap();
+        assert!(matches!(session.receive().await.unwrap(),
+            SessionEvent::Bulk(BulkRecord::Credit {id: credit_id, next: 0}) if credit_id == id));
+        session
+            .send_bulk(BulkRecord::Chunk {
+                id,
+                index: 0,
+                bytes: Zeroizing::new(payload.bytes().to_vec()),
+            })
+            .await
+            .unwrap();
+        assert!(session.receive().await.is_err());
+    };
+    let recipient = async {
+        let Incoming::Session(mut session) = listener.accept(&inviter, "inviter").await.unwrap()
+        else {
+            panic!("expected session");
+        };
+        assert!(matches!(session.receive().await.unwrap(),
+            SessionEvent::Bulk(BulkRecord::Begin(manifest)) if manifest.id == id));
+        session
+            .send_bulk(BulkRecord::Credit { id, next: 0 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.receive().await,
+            Err(Error::Peer(PeerError::Crypto(_)))
+        ));
+        assert!(matches!(session.receive().await, Err(Error::Closed)));
+    };
+    tokio::join!(attack, sender, recipient);
+}
+
+#[tokio::test]
+async fn disconnect_during_bulk_never_completes_and_peer_can_reconnect() {
+    use lyteboard_core::bulk::{Payload, Receiver};
+    use lyteboard_protocol::peer::{BulkRecord, CHUNK_BYTES};
+
+    let (mut listener, inviter, scanner) = paired().await;
+    let (mut sender, mut recipient) = session(&mut listener, &inviter, &scanner).await;
+    let payload = Payload::text("a".repeat(CHUNK_BYTES + 1)).unwrap();
+    let id = [5; 16];
+    sender
+        .send_bulk(BulkRecord::Begin(payload.manifest(id)))
+        .await
+        .unwrap();
+    let SessionEvent::Bulk(BulkRecord::Begin(manifest)) = recipient.receive().await.unwrap() else {
+        panic!("expected bulk manifest");
+    };
+    let mut receiver = Receiver::new(manifest).unwrap();
+    recipient
+        .send_bulk(BulkRecord::Credit { id, next: 0 })
+        .await
+        .unwrap();
+    assert!(matches!(sender.receive().await.unwrap(),
+        SessionEvent::Bulk(BulkRecord::Credit {id: credit_id, next: 0}) if credit_id == id));
+    sender
+        .send_bulk(BulkRecord::Chunk {
+            id,
+            index: 0,
+            bytes: Zeroizing::new(payload.bytes()[..CHUNK_BYTES].to_vec()),
+        })
+        .await
+        .unwrap();
+    let SessionEvent::Bulk(BulkRecord::Chunk { id, index, bytes }) =
+        recipient.receive().await.unwrap()
+    else {
+        panic!("expected bulk chunk");
+    };
+    receiver.chunk(id, index, &bytes).unwrap();
+    drop(sender);
+    assert!(recipient.receive().await.is_err());
+    assert!(receiver.finish(id).await.is_err());
+    drop(recipient);
+
+    let (mut sender, mut recipient) = session(&mut listener, &inviter, &scanner).await;
+    exchange(&mut sender, &mut recipient, "fresh session").await;
+}

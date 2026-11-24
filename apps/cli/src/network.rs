@@ -10,7 +10,7 @@ use lyteboard_core::ipc::{
     Client,
     network::{
         Command as Request, ConnectionState, DEVICES_PER_PAGE, Delivery, DiscoveryState,
-        MAX_TEST_TEXT_BYTES, PairStatus, Reply,
+        MAX_TEST_TEXT_BYTES, PairStatus, QueueOutcome, Reply,
     },
 };
 use tokio::time::{sleep, timeout};
@@ -187,7 +187,15 @@ pub async fn run(client: &Client, command: Command) -> Result<(), CommandError> 
                 println!("Device removed");
             }
         },
-        Command::Send { device: peer, text } => send_text(client, peer, text).await?,
+        Command::Send {
+            device: peer, text, ..
+        } => {
+            let text = match text {
+                Some(text) => text,
+                None => read_stdin_text()?,
+            };
+            send_text(client, peer, text).await?;
+        }
         Command::Received { limit } => {
             for offset in 0..usize::from(limit) {
                 let Reply::Received(message) =
@@ -276,9 +284,39 @@ async fn list_discovered(client: &Client) -> Result<(), CommandError> {
     }
 }
 
+fn read_stdin_text() -> Result<String, CommandError> {
+    let media = lyteboard_core::bulk::Media::Text;
+    let mut bytes = Zeroizing::new(Vec::new());
+    io::stdin()
+        .lock()
+        .take((media.limit() + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(CommandError::Terminal)?;
+    lyteboard_core::bulk::validate_size(media, bytes.len())
+        .map_err(|error| CommandError::Network(error.to_string()))?;
+    std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|_| CommandError::Network("Standard input must contain UTF-8 text.".into()))
+}
+
 async fn send_text(client: &Client, peer: [u8; 32], text: String) -> Result<(), CommandError> {
-    let id = queue_text(client, peer, text).await?;
-    timeout(Duration::from_secs(30), async {
+    let id = if text.len() > MAX_TEST_TEXT_BYTES {
+        let mut outcomes = client
+            .upload_bulk(
+                vec![hex::encode(peer)],
+                lyteboard_core::bulk::Media::Text,
+                text.as_bytes(),
+            )
+            .await?;
+        match outcomes.pop() {
+            Some(QueueOutcome::Queued(id)) => id,
+            Some(QueueOutcome::Error(error)) => return Err(CommandError::Network(error)),
+            None => return Err(unexpected()),
+        }
+    } else {
+        queue_text(client, peer, text).await?
+    };
+    timeout(Duration::from_secs(75), async {
         loop {
             match request(client, Request::Delivery { id }).await? {
                 Reply::Delivery(Delivery::Pending) => sleep(Duration::from_millis(100)).await,
@@ -297,11 +335,7 @@ async fn send_text(client: &Client, peer: [u8; 32], text: String) -> Result<(), 
     .map_err(|_| CommandError::Network("Delivery was not confirmed in time.".into()))?
 }
 
-pub(crate) async fn queue_text(
-    client: &Client,
-    peer: [u8; 32],
-    text: String,
-) -> Result<u64, CommandError> {
+async fn queue_text(client: &Client, peer: [u8; 32], text: String) -> Result<u64, CommandError> {
     if text.is_empty() || text.len() > MAX_TEST_TEXT_BYTES || text.contains('\0') {
         return Err(CommandError::Network(format!(
             "Text must be 1–{MAX_TEST_TEXT_BYTES} UTF-8 bytes without NUL."

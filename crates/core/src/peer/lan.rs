@@ -7,8 +7,8 @@ use std::{
 };
 
 use lyteboard_protocol::peer::{
-    FrameKind, LanInvite, MAX_ENVELOPE_BYTES, NoiseKey, Path, PeerFailure, QrCode, RoutedFrame,
-    WireError, validate_lan_address,
+    BulkRecord, FrameKind, LanInvite, MAX_ENVELOPE_BYTES, NoiseKey, Path, PeerFailure, QrCode,
+    RoutedFrame, WireError, validate_lan_address,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -269,17 +269,32 @@ impl<'a> TcpSession<'a> {
         link.wait_for_input().await
     }
 
-    pub async fn reject_text(&mut self, id: [u8; 16], reason: PeerFailure) -> Result<(), Error> {
+    pub async fn reject_payload(&mut self, id: [u8; 16], reason: PeerFailure) -> Result<(), Error> {
         self.send(|session, now| session.peer_error(Some(id), reason, now))
             .await
     }
 
-    pub async fn send_text(&mut self, text: &str) -> Result<[u8; 16], Error> {
+    pub async fn send_bulk(&mut self, record: BulkRecord) -> Result<(), Error> {
+        self.send(|session, now| session.send_bulk(record, now))
+            .await
+    }
+
+    pub fn transfer_id() -> Result<[u8; 16], Error> {
         let mut id = [0; 16];
         random(&mut id)?;
+        Ok(id)
+    }
+
+    pub async fn send_text(&mut self, text: &str) -> Result<[u8; 16], Error> {
+        let id = Self::transfer_id()?;
         self.send(|session, now| session.send_text(id, text, now))
             .await?;
         Ok(id)
+    }
+
+    pub fn ensure_active(&self) -> Result<(), Error> {
+        let (_, session) = self.channel.as_ref().ok_or(Error::Closed)?;
+        Ok(session.ensure_active(now()?)?)
     }
 
     pub async fn acknowledge(&mut self, id: [u8; 16]) -> Result<(), Error> {
@@ -322,6 +337,8 @@ struct Link {
 
 impl Link {
     fn new(stream: TcpStream, local: NoiseKey) -> Result<Self, Error> {
+        // Small authenticated credit records must not wait behind TCP's delayed ACKs.
+        stream.set_nodelay(true)?;
         #[cfg(target_os = "linux")]
         {
             use rustix::net::sockopt;

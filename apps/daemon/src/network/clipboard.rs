@@ -1,7 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use lyteboard_core::clipboard::Clipboard;
-use lyteboard_protocol::ipc::network::{MAX_TEST_TEXT_BYTES, Reply};
+use lyteboard_protocol::{ipc::network::Reply, peer::MAX_BULK_TEXT_BYTES};
 use tokio::{
     sync::watch,
     task::{AbortHandle, spawn_local},
@@ -47,7 +47,7 @@ impl AutoClipboard {
             while incoming.changed().await.is_ok() {
                 let text = incoming.borrow_and_update().clone();
                 if let Some(text) = text {
-                    let result = clipboard.write_text(&text, MAX_TEST_TEXT_BYTES).await;
+                    let result = clipboard.write_text(&text, MAX_BULK_TEXT_BYTES).await;
                     *status.borrow_mut() = result.err().map(|error| error.to_string());
                 }
             }

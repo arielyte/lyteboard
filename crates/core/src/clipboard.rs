@@ -2,6 +2,7 @@
 
 use std::{env, ffi::OsStr, io, process::Stdio, time::Duration};
 
+use lyteboard_protocol::peer::Media;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -12,6 +13,7 @@ use zeroize::Zeroizing;
 
 const TOOL_TIMEOUT: Duration = Duration::from_millis(1500);
 const DIAGNOSTIC_LIMIT: u64 = 1024;
+const TARGETS_LIMIT: usize = 4096;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -28,8 +30,10 @@ pub enum Error {
     Timeout(&'static str),
     #[error("Clipboard has no text.")]
     Empty,
-    #[error("Clipboard text exceeds the {0}-byte transfer limit.")]
+    #[error("Clipboard content exceeds the {0}-byte transfer limit.")]
     TooLarge(usize),
+    #[error("Clipboard has no supported text or image.")]
+    NoSupportedContent,
     #[error("Clipboard text must be UTF-8 without NUL bytes.")]
     InvalidText,
 }
@@ -53,8 +57,28 @@ impl Clipboard {
             .ok_or(Error::NoSession)
     }
 
-    pub async fn read_text(self, limit: usize) -> Result<Zeroizing<String>, Error> {
-        let (tool, args) = self.0.reader();
+    pub async fn read_content(self) -> Result<(Media, Zeroizing<Vec<u8>>), Error> {
+        let (tool, args) = self.0.targets();
+        let targets = self.read_bytes(tool, args, TARGETS_LIMIT).await?;
+        let targets = std::str::from_utf8(&targets).map_err(|_| self.0.access())?;
+        let media = select_media(targets).ok_or(Error::NoSupportedContent)?;
+        let (tool, args) = self.0.reader(media);
+        let bytes = self.read_bytes(tool, &args, media.limit()).await?;
+        if media == Media::Text {
+            let text = std::str::from_utf8(&bytes).map_err(|_| Error::InvalidText)?;
+            validate_text(text, media.limit())?;
+        } else if bytes.is_empty() {
+            return Err(Error::NoSupportedContent);
+        }
+        Ok((media, bytes))
+    }
+
+    async fn read_bytes(
+        self,
+        tool: &'static str,
+        args: &[&str],
+        limit: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
         let mut child = self
             .0
             .spawn(tool, args, Stdio::null(), Stdio::piped(), Stdio::piped())?;
@@ -87,9 +111,7 @@ impl Clipboard {
             if !status.success() {
                 return Err(self.0.read_error(&diagnostic));
             }
-            let text = std::str::from_utf8(&text).map_err(|_| Error::InvalidText)?;
-            validate_text(text, limit)?;
-            Ok(Zeroizing::new(text.to_owned()))
+            Ok(text)
         })
         .await
         .map_err(|_| Error::Timeout(self.0.hint()))?
@@ -97,17 +119,28 @@ impl Clipboard {
 
     pub async fn write_text(self, text: &str, limit: usize) -> Result<(), Error> {
         validate_text(text, limit)?;
-        let (tool, args) = self.0.writer();
+        self.write_content(Media::Text, text.as_bytes()).await
+    }
+
+    pub async fn write_content(self, media: Media, bytes: &[u8]) -> Result<(), Error> {
+        if media == Media::Text {
+            validate_text(
+                std::str::from_utf8(bytes).map_err(|_| Error::InvalidText)?,
+                media.limit(),
+            )?;
+        } else if bytes.is_empty() {
+            return Err(Error::NoSupportedContent);
+        } else if bytes.len() > media.limit() {
+            return Err(Error::TooLarge(media.limit()));
+        }
+        let (tool, args) = self.0.writer(media);
         // The owner can fork to serve later clipboard reads. Never hold its stdout or stderr open.
         let mut child = self
             .0
-            .spawn(tool, args, Stdio::piped(), Stdio::null(), Stdio::null())?;
+            .spawn(tool, &args, Stdio::piped(), Stdio::null(), Stdio::null())?;
         let mut stdin = child.stdin.take().expect("clipboard writer pipes stdin");
         timeout(TOOL_TIMEOUT, async {
-            stdin
-                .write_all(text.as_bytes())
-                .await
-                .map_err(|_| self.0.access())?;
+            stdin.write_all(bytes).await.map_err(|_| self.0.access())?;
             drop(stdin);
             let status = child.wait().await.map_err(|_| self.0.access())?;
             if status.success() {
@@ -122,7 +155,7 @@ impl Clipboard {
 
     /// Check that the writer is installed before enabling unattended application.
     pub async fn check_writer(self) -> Result<(), Error> {
-        let (tool, _) = self.0.writer();
+        let (tool, _) = self.0.writer(Media::Text);
         let args = if self.0 == Backend::Wayland {
             &["--version"]
         } else {
@@ -154,30 +187,62 @@ fn select_backend(session: Option<&OsStr>, wayland: bool, x11: bool) -> Option<B
 }
 
 impl Backend {
-    fn reader(self) -> (&'static str, &'static [&'static str]) {
+    fn targets(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::Wayland => ("wl-paste", &["--no-newline", "--type", "text"]),
+            Self::Wayland => ("wl-paste", &["--list-types"]),
             Self::X11 => (
                 "xclip",
-                &["-selection", "clipboard", "-out", "-target", "UTF8_STRING"],
+                &["-selection", "clipboard", "-out", "-target", "TARGETS"],
             ),
         }
     }
 
-    fn writer(self) -> (&'static str, &'static [&'static str]) {
+    fn reader(self, media: Media) -> (&'static str, Vec<&'static str>) {
         match self {
             Self::Wayland => (
-                "wl-copy",
-                &["--type", "text/plain;charset=utf-8", "--sensitive"],
+                "wl-paste",
+                vec![
+                    "--no-newline",
+                    "--type",
+                    if media == Media::Text {
+                        "text"
+                    } else {
+                        media.mime()
+                    },
+                ],
             ),
             Self::X11 => (
                 "xclip",
-                &[
+                vec![
+                    "-selection",
+                    "clipboard",
+                    "-out",
+                    "-target",
+                    if media == Media::Text {
+                        "UTF8_STRING"
+                    } else {
+                        media.mime()
+                    },
+                ],
+            ),
+        }
+    }
+
+    fn writer(self, media: Media) -> (&'static str, Vec<&'static str>) {
+        match self {
+            Self::Wayland => ("wl-copy", vec!["--type", media.mime(), "--sensitive"]),
+            Self::X11 => (
+                "xclip",
+                vec![
                     "-selection",
                     "clipboard",
                     "-in",
                     "-target",
-                    "UTF8_STRING",
+                    if media == Media::Text {
+                        "UTF8_STRING"
+                    } else {
+                        media.mime()
+                    },
                     "-silent",
                 ],
             ),
@@ -238,11 +303,32 @@ impl Backend {
             ),
             Self::X11 => matches!(
                 line,
-                "Error: target UTF8_STRING not available" | "Error: target STRING not available"
+                "Error: target UTF8_STRING not available"
+                    | "Error: target STRING not available"
+                    | "Error: target TARGETS not available"
             ),
         });
         if empty { Error::Empty } else { self.access() }
     }
+}
+
+fn select_media(targets: &str) -> Option<Media> {
+    for media in [Media::Png, Media::Jpeg, Media::Webp] {
+        if targets.lines().any(|target| target.trim() == media.mime()) {
+            return Some(media);
+        }
+    }
+    targets
+        .lines()
+        .any(|target| {
+            let target = target.trim();
+            matches!(target, "UTF8_STRING" | "STRING" | "TEXT")
+                || target
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.eq_ignore_ascii_case("text/plain"))
+        })
+        .then_some(Media::Text)
 }
 
 fn validate_text(text: &str, limit: usize) -> Result<(), Error> {

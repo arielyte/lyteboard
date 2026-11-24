@@ -32,6 +32,9 @@ pub enum ClientError {
     Decode(#[from] DecodeError),
     #[error("daemon rejected the request: {0}")]
     Rejected(ErrorCode),
+    #[cfg(target_os = "linux")]
+    #[error("{0}")]
+    Bulk(String),
     #[error("daemon returned an unexpected response")]
     UnexpectedResponse,
 }
@@ -92,6 +95,25 @@ impl Client {
             Response::Network(reply) => Ok(reply),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn upload_bulk(
+        &self,
+        peers: Vec<String>,
+        media: lyteboard_protocol::peer::Media,
+        bytes: &[u8],
+    ) -> Result<Vec<network::QueueOutcome>, ClientError> {
+        linux::upload(&self.endpoint, peers, media, bytes).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn download_bulk(
+        &self,
+        offset: usize,
+    ) -> Result<Option<(lyteboard_protocol::peer::Media, zeroize::Zeroizing<Vec<u8>>)>, ClientError>
+    {
+        linux::download(&self.endpoint, offset).await
     }
 
     async fn request(&self, request: Request) -> Result<Response, ClientError> {

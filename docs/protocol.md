@@ -1,6 +1,6 @@
 # LAN peer protocol proposal
 
-LAN-1 implements direct TCP pairing, confirmed sessions, and manual text records in the Rust core. Image transfer, retry policy, and local bulk transfer below are proposals. The LAN handshake uses a separate Noise domain from the Phase 2B in-memory fixtures. The Linux IPC version stays independent. See [security design](security.md) for the trust model and cryptographic choices.
+Lyteboard uses direct TCP pairing, confirmed Noise sessions, and encrypted clipboard records on the LAN. The LAN handshake uses a separate Noise domain from the Phase 2B in-memory fixtures. The Linux IPC version stays independent. See [security design](security.md) for the trust model and cryptographic choices.
 
 ## Encoding and limits
 
@@ -13,8 +13,8 @@ Encode each message as a deterministic CBOR array using a bounded decoder such a
 | Connect and handshake | Two seconds to dial within a 10-second handshake budget. Handshake payloads are empty. Each listener processes one initial handshake at a time, and the peer core caps pending handshakes. |
 | Pending pairing | Five minutes from invitation creation, including approval. One authenticated attempt per invitation and one live invitation per endpoint. |
 | Peer sessions | At most 32 active trust records per endpoint, two established channels per peer (one initiated by each side), and one in-progress candidate per peer and initiating side. |
-| Text and image | 16 KiB UTF-8 text, 10 MiB encoded image, 32 KiB raw image chunks. Mark delivery uncertain after 10 seconds without an acknowledgment following `Text` or `ImageEnd`. |
-| Image receive budget | Two inbound images per endpoint. Expire after 15 seconds without progress or 120 seconds total. |
+| Bulk clipboard payloads | 1 MiB UTF-8 text or 10 MiB encoded image. Inline daemon text stays at 512 bytes. Each encrypted bulk record carries at most 32 KiB of payload. |
+| Bulk receive budget | Two incomplete inbound transfers and one validation task per daemon. A transfer expires after 10 seconds without progress or 60 seconds total. |
 
 ## QR invitation and pairing
 
@@ -53,20 +53,20 @@ Use active local pins to start KK. Both Noise flights carry empty payloads. Afte
 | Pairing | `[lan_version, 5]` | `PairReject`. Close the attempt. |
 | Session | `[lan_version, 6]` | `Ready`, in the key confirmation order above. |
 | Session | `[lan_version, 7, id, text]` | `Text`. Require nonempty UTF-8 without NUL within the text limit. |
-| Session | `[lan_version, 8, id, media:uint, total:uint, sha256:b32]` | `ImageBegin`. Media `1` PNG, `2` JPEG, `3` WebP. `total` is the nonzero encoded byte count within the image limit. |
-| Session | `[lan_version, 9, id]` | `ImageReady`. Receiver reserved an image slot. |
-| Session | `[lan_version, 10, id, index:uint, chunk:b]` | `ImageChunk`. Start at index zero, contiguous, every chunk exactly 32 KiB except the final remainder. |
-| Session | `[lan_version, 11, id]` | `ImageEnd`. Verify complete size, digest, and allowed format before acceptance. |
+| Session | `[lan_version, 8, id, media:uint, total:uint, sha256:b32]` | `BulkBegin`. Media `0` text, `1` PNG, `2` JPEG, `3` WebP. `total` is the nonzero byte count within the media limit. |
+| Session | `[lan_version, 9, id, next:uint]` | `BulkCredit`. Receiver reserved a slot or accepted the previous chunk. The next index starts at zero. |
+| Session | `[lan_version, 10, id, index:uint, chunk:b]` | `BulkChunk`. Start at index zero, contiguous, every chunk exactly 32 KiB except the final remainder. |
+| Session | `[lan_version, 11, id]` | `BulkEnd`. Verify complete size, digest, and allowed format before acceptance. |
 | Session | `[lan_version, 12, id, result:uint]` | `DeliveryAck`. `0` accepted, `1` previously accepted. This means the receiving endpoint accepted the transfer and gives no guarantee of a paste or durable history. |
 | Session | `[lan_version, 13, id_or_null, code:uint]` | `PeerError`. `1` invalid payload, `2` too large, `3` unsupported media, `4` integrity failed, `5` busy, `6` timed out, `7` denied. |
 | Session | `[lan_version, 14]` | Authenticated `Close`. Incomplete transfers are discarded. |
 
-Send chunks only after `ImageReady`. The receiver accepts no extra chunks after the declared total. Compare the incremental SHA-256 digest with the authenticated manifest. Identify the actual format and use bounded decoding before rendering. Initial decode targets are one concurrent decoder per endpoint, at most 16 million pixels, 8,192 pixels on either axis, 64 MiB decoded output, and no animated images. Keep incomplete data in bounded memory and discard it on timeout, disconnect, cancel, revocation, or validation failure. An interrupted image starts from byte zero on retry.
+The sender waits for the receiver's encrypted credit before sending each chunk or the end record. The receiver enforces ordered IDs, indices, lengths, and declared size before accepting more data. At the end it checks SHA-256 and validates the complete payload. Text must be UTF-8 without NUL bytes. Static images must decode in the declared format, with each axis at most 8,192 pixels, at most 16 million pixels, and decoded output at most 64 MiB. The receiver publishes the validated bytes before sending the authenticated delivery acknowledgment.
 
-For one recipient use one session and one transfer ID. For multiple recipients, including broadcast to the active trust list, send independently encrypted copies with per-recipient IDs, limits, and delivery results. No group key. Retain each recipient's ID for retry and never reuse an ID for new content. The receiver serializes acceptance by `(pinned sender Noise key, transfer ID)` across channels. Keep completed IDs in a memory-only cache for up to 24 hours, capped at 256 per peer and 4,096 total. A known completed ID returns a duplicate acknowledgment without publication or an image slot. A second in-progress transfer with the same ID gets `busy`. Deduplication is best-effort across cache eviction or restart. Do not promise exactly-once delivery.
+Each recipient gets an independent session and random transfer ID. Partial buffers are discarded on disconnect, timeout, or revocation. A failed or uncertain transfer requires another explicit send. Bulk records require LAN-4B at both ends.
 
 On transport loss, LAN-1 discards session keys. The caller can redial the QR address and establish a fresh channel with new Noise state. The Linux profile saves the QR endpoint on the scanner and refreshes the dial hint after a successful outbound session. The current protocol carries no scanner listener address. An address change can interrupt automatic reconnection until discovery or manual IP fallback is available. Surface authentication failures without changing pins. Retry connections with exponential backoff and jitter starting at 1 second and capped at 60 seconds. A failed attempt does not imply that previous user data was delivered. Retry a transfer only while it is still explicitly pending in the local sender, with the same ID and fresh encryption.
 
-## Future local bulk transfer
+## Local bulk transfer
 
-Keep the verified 4 KiB IPC framing unchanged. Future control requests can authorize a bounded import or export using a random one-shot `b16` handle tied to the local UID, direction, expected length, and operation. A second user-private stream socket such as `$XDG_RUNTIME_DIR/lyteboard/transfer.sock` checks kernel peer credentials and consumes the handle in a bounded preamble. Expire unused handles after 30 seconds. Stream only the declared number of bytes, enforce the same payload ceilings, per-user slot budgets and deadlines, and abort on partial streams. No arbitrary paths, client-supplied identity, or base64 image buffers in the control IPC. Windows can provide the equivalent named-pipe adapter. Android can use bounded in-process buffers through UniFFI.
+Linux uses the existing same-UID authenticated Unix socket. The request and reply metadata use the existing 4 KiB control framing. After an upload-ready reply, the CLI writes the exact declared number of bytes and half-closes its write side. For downloads, the daemon sends bounded media and size metadata, writes that many bytes, and half-closes. A short stream, excess bytes, oversized declaration, or 20-second deadline fails the operation. Two local bulk streams can run at once. The protocol accepts no file paths, and payloads stay in memory.

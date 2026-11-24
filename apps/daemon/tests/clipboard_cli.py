@@ -2,11 +2,17 @@
 """Run after building the Linux CLI and daemon. --kwin uses real isolated Wayland selections."""
 
 import argparse
+import base64
 from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
 import signal
+import select
+import random
+import socket
+import struct
+import zlib
 import subprocess
 import tempfile
 import time
@@ -25,16 +31,20 @@ path = Path(os.environ["LYTEBOARD_TEST_CLIPBOARD"])
 if args in (["--version"], ["-version"]):
     sys.exit(0)
 if tool == "wl-paste" or "-out" in args:
-    assert args == (["--no-newline", "--type", "text"] if tool == "wl-paste"
-                    else ["-selection", "clipboard", "-out", "-target", "UTF8_STRING"])
     if not path.exists():
         print("Nothing is copied" if tool == "wl-paste"
               else "Error: target UTF8_STRING not available", file=sys.stderr)
         sys.exit(1)
+    mime = path.with_suffix(".type").read_text()
+    if "--list-types" in args or "TARGETS" in args:
+        print(mime)
+        sys.exit(0)
+    assert args == (["--no-newline", "--type", "text" if mime.startswith("text/") else mime] if tool == "wl-paste"
+                    else ["-selection", "clipboard", "-out", "-target", "UTF8_STRING" if mime.startswith("text/") else mime])
     sys.stdout.buffer.write(path.read_bytes())
 else:
-    assert args == (["--type", "text/plain;charset=utf-8", "--sensitive"] if tool == "wl-copy"
-                    else ["-selection", "clipboard", "-in", "-target", "UTF8_STRING", "-silent"])
+    mime = args[1] if tool == "wl-copy" else args[4]
+    (path.with_suffix(".type")).write_text("text/plain;charset=utf-8" if mime == "UTF8_STRING" else mime)
     data = sys.stdin.buffer.read()
     if path.with_suffix(".blocked").exists():
         sys.stderr.buffer.write(data)
@@ -59,10 +69,11 @@ class SimulatedSelection:
                           XDG_SESSION_TYPE="x11" if x11 else "wayland",
                           WAYLAND_DISPLAY="fake-wayland", DISPLAY=":fake")
 
-    def read(self):
+    def read(self, _mime=None):
         return self.file.read_bytes() if self.file.exists() else None
 
-    def seed(self, data):
+    def seed(self, data, mime="text/plain;charset=utf-8"):
+        self.file.with_suffix(".type").write_text(mime)
         self.file.write_bytes(data)
 
 
@@ -81,6 +92,7 @@ def stop_kwin(process):
 class KwinSelection:
     def __init__(self, root, device, cleanup, x11=False):
         self.x11 = x11
+        self.cleanup = cleanup
         home = root / f"kwin-{device.env['LYTEBOARD_DEVICE_NAME']}"
         for name in ("run", "data", "config"):
             (home / name).mkdir(mode=0o700, parents=True)
@@ -122,9 +134,9 @@ time.sleep(3600)
             device.env["XDG_SESSION_TYPE"] = "x11"
         self.env = device.env
 
-    def read(self):
-        command = (["xclip", "-selection", "clipboard", "-out", "-target", "UTF8_STRING"]
-                   if self.x11 else ["wl-paste", "--no-newline", "--type", "text"])
+    def read(self, mime=None):
+        command = (["xclip", "-selection", "clipboard", "-out", "-target", mime or "UTF8_STRING"]
+                   if self.x11 else ["wl-paste", "--no-newline", "--type", mime or "text"])
         result = subprocess.run(command, env=self.env, capture_output=True, timeout=3)
         if result.returncode:
             if b"Nothing is copied" in result.stderr or b"STRING not available" in result.stderr:
@@ -133,15 +145,64 @@ time.sleep(3600)
         return result.stdout
 
     def seed(self, data, mime="text/plain;charset=utf-8"):
-        command = (["xclip", "-selection", "clipboard", "-in", "-target", "UTF8_STRING", "-silent"]
-                   if self.x11 else ["wl-copy", "--type", mime, "--sensitive"])
-        subprocess.run(command, env=self.env, input=data, check=True, timeout=3,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not self.x11:
+            subprocess.run(["wl-copy", "--type", mime, "--sensitive"], env=self.env,
+                           input=data, check=True, timeout=3,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
+        target = "UTF8_STRING" if mime.startswith("text/") else mime
+        process = subprocess.Popen(
+            ["xclip", "-selection", "clipboard", "-in", "-target", target, "-quiet"],
+            env=dict(self.env, LC_ALL="C"), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+        self.cleanup.callback(stop_kwin, process)
+        process.stdin.write(data)
+        process.stdin.close()
+        assert select.select([process.stderr], [], [], 3)[0]
+        assert b"Waiting for selection requests" in process.stderr.readline()
+
 
 
 def expect_failure(result, message):
     assert result.returncode != 0
     assert message in result.stderr, result.stderr
+
+
+def png(width, height, exact_size=None):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    header = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    random_bytes = random.Random(13)
+    if exact_size:
+        rows = (b"\0" * (1 + 3 * width)) * height
+    else:
+        rows = b"".join(b"\0" + random_bytes.randbytes(3 * width) for _ in range(height))
+    tail = chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+    metadata = b""
+    if exact_size:
+        metadata = chunk(b"tEXt", b"Note\0" + b" " * (exact_size - len(header) - len(tail) - 17))
+    return header + metadata + tail
+
+
+def local_upload(device, peer, size):
+    control = json.dumps({"version": 1, "body": {"network": {
+        "bulk_upload": {"peers": [peer], "media": "text", "size": size},
+    }}}).encode()
+    stream = socket.socket(socket.AF_UNIX)
+    stream.settimeout(3)
+    stream.connect(str(Path(device.env["XDG_RUNTIME_DIR"]) / "lyteboard" / "daemon.sock"))
+    stream.sendall(struct.pack(">I", len(control)) + control)
+    return stream
+
+
+def response(stream):
+    with stream.makefile("rb") as reader:
+        size, = struct.unpack(">I", reader.read(4))
+        assert size <= 4096
+        return json.loads(reader.read(size))["body"]["data"]
 
 
 def exercise(alpha, beta, gamma, source, manual, automatic, kwin, x11):
@@ -156,12 +217,13 @@ def exercise(alpha, beta, gamma, source, manual, automatic, kwin, x11):
     expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "Clipboard has no text")
     if kwin and not x11:
         source.seed(b"disposable non-text payload", mime="application/octet-stream")
-        expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "Clipboard has no text")
+        expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "Clipboard has no supported text or image")
 
-    oversized = ("é" * 257).encode()
+    oversized = ("é" * (1024 * 1024 // 2 + 16384)).encode()
     source.seed(oversized)
-    expect_failure(alpha.run("clipboard", "send", beta_id, gamma_id, check=False), "512-byte transfer limit")
-    assert source.read() == oversized
+    expect_failure(alpha.run("clipboard", "send", beta_id, gamma_id, check=False), "1048576-byte transfer limit")
+    if not x11:
+        assert source.read() == oversized
     assert beta.cli("received") == gamma.cli("received") == "No received messages"
 
     old = b"Local clipboard remains available"
@@ -200,7 +262,7 @@ def exercise(alpha, beta, gamma, source, manual, automatic, kwin, x11):
         assert automatic.read() == later
 
     gamma.cli("clipboard", "auto", "off")
-    exact_limit = ("é" * 256).encode()
+    exact_limit = ("a" + "é" * (1024 * 1024 // 2 - 1) + "z").encode()
     source.seed(exact_limit)
     assert alpha.cli("clipboard", "send", gamma_id) == "Clipboard delivered to 1/1 devices"
     assert automatic.read() == later
@@ -209,7 +271,62 @@ def exercise(alpha, beta, gamma, source, manual, automatic, kwin, x11):
     oldest = 3 if kwin else 4
     gamma.cli("clipboard", "copy", "--index", str(oldest))
     assert automatic.read() == text
-    expect_failure(gamma.run("clipboard", "copy", "--index", str(oldest + 1), check=False), "No received text")
+    expect_failure(gamma.run("clipboard", "copy", "--index", str(oldest + 1), check=False), "No received content")
+
+    # Local bulk data has a separately bounded raw phase. A partial sender
+    # must release its slot, and extra data must never reach a recipient.
+    with local_upload(alpha, gamma_id, 4096) as interrupted, local_upload(alpha, gamma_id, 4096) as another:
+        assert response(interrupted) == "bulk_ready"
+        assert response(another) == "bulk_ready"
+        interrupted.sendall(b"partial")
+        with local_upload(alpha, gamma_id, 4096) as busy:
+            assert "busy" in response(busy)["error"]
+        assert alpha.cli("ping") == "Pong"
+    assert alpha.cli("ping") == "Pong"
+    with local_upload(alpha, gamma_id, 3) as excessive:
+        assert response(excessive) == "bulk_ready"
+        excessive.sendall(b"four")
+        excessive.shutdown(socket.SHUT_WR)
+        assert "declared length" in response(excessive)["error"]
+
+    stale = automatic.read()
+    image = png(160, 160)
+    assert len(image) > 32 * 1024
+    source.seed(image, "image/png")
+    assert alpha.cli("clipboard", "send", beta_id, gamma_id) == "Clipboard delivered to 2/2 devices"
+    assert automatic.read() == stale
+    assert beta.cli("clipboard", "copy") == "Copied received image"
+    assert gamma.cli("clipboard", "copy") == "Copied received image"
+    assert manual.read("image/png") == automatic.read("image/png") == image
+
+    tiny_images = {
+        "image/jpeg": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAA0JCgsKCA0LCgsODg0PEyAVExISEyccHhcgLikxMC4pLSwzOko+MzZGNywtQFdBRkxOUlNSMj5aYVpQYEpRUk//2wBDAQ4ODhMREyYVFSZPNS01T09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0//wAARCAACAAIDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABAf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCCAUkN/9k=",
+        "image/webp": "UklGRjgAAABXRUJQVlA4ICwAAACQAQCdASoCAAIAAgA0JaACdLoAA5gA/vmTb/+QH/+QH/+QH/8gP+IXeyAwAA==",
+    }
+    for mime, encoded in tiny_images.items():
+        image_bytes = base64.b64decode(encoded)
+        source.seed(image_bytes, mime)
+        assert alpha.cli("clipboard", "send", beta_id) == "Clipboard delivered to 1/1 devices"
+        assert beta.cli("clipboard", "copy") == "Copied received image"
+        assert manual.read(mime) == image_bytes
+
+    source.seed(image[:-12], "image/png")
+    expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "Image is malformed")
+    source.seed(png(8193, 1), "image/png")
+    expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "dimension or decoded size limit")
+    if not kwin:
+        source.seed(b"0" * (10 * 1024 * 1024 + 1), "image/png")
+        expect_failure(alpha.run("clipboard", "send", beta_id, check=False), "10485760-byte transfer limit")
+        largest_image = png(16, 16, exact_size=10 * 1024 * 1024)
+        source.seed(largest_image, "image/png")
+        assert alpha.cli("clipboard", "send", gamma_id) == "Clipboard delivered to 1/1 devices"
+        gamma.cli("clipboard", "copy")
+        assert automatic.read("image/png") == largest_image
+    stdin_text = "入力✓" * 30_000
+    assert alpha.cli("send", gamma_id, "--stdin", input_text=stdin_text) == "Delivered"
+    gamma.cli("clipboard", "copy")
+    assert automatic.read() == stdin_text.encode()
+    assert alpha.cli("received") == "No received messages"
 
     original = alpha.env.copy()
     try:

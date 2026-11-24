@@ -1,40 +1,53 @@
 //! The LAN worker owns peer state and runs away from the authenticated IPC runtime.
 
+mod bulk;
 mod clipboard;
 mod discovery;
 mod sessions;
 
 use std::{
-    cell::RefCell, collections::VecDeque, env, io, net::SocketAddr, path::PathBuf, rc::Rc,
-    sync::Arc, time::Duration,
+    cell::RefCell, env, io, net::SocketAddr, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
 };
 
-use lyteboard_core::clipboard::Clipboard;
 use lyteboard_core::peer::{
     CredentialError, Endpoint, PairingStatus,
     lan::{self, Incoming, Listener, PendingPair},
     storage::{StorageError, open_endpoint},
 };
+use lyteboard_core::{bulk::Payload, clipboard::Clipboard};
 use lyteboard_protocol::{
     ipc::network::{
-        Command, DEVICES_PER_PAGE, Device, Discovered, DiscoveryState, Message, PairStatus, Reply,
+        Command, DEVICES_PER_PAGE, Device, Discovered, DiscoveryState, PairStatus, QueueOutcome,
+        Reply,
     },
-    peer::{MAX_LABEL_BYTES, validate_label},
+    peer::{MAX_LABEL_BYTES, NoiseKey, validate_label},
 };
 use tokio::{
     runtime,
-    sync::{Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{AbortHandle, LocalSet, spawn_local},
     time::{Instant, MissedTickBehavior, interval, sleep, timeout},
 };
 use zeroize::Zeroizing;
 
+use bulk::{Batch, Inbox};
 use clipboard::AutoClipboard;
 use discovery::{Discovery, Hints, LocalNetworks};
 use sessions::Sessions;
 
 #[derive(Clone)]
-pub struct Network(mpsc::Sender<(Command, oneshot::Sender<Reply>)>);
+pub struct Network(mpsc::Sender<(Operation, oneshot::Sender<Output>)>);
+
+enum Operation {
+    Control(Command),
+    Upload(Vec<NoiseKey>, Payload, OwnedSemaphorePermit),
+    Download(usize),
+}
+
+enum Output {
+    Control(Reply),
+    Download(Option<Arc<Payload>>),
+}
 
 impl Network {
     pub fn start() -> io::Result<(Self, oneshot::Receiver<()>)> {
@@ -53,15 +66,41 @@ impl Network {
     }
 
     pub async fn request(&self, command: Command) -> Reply {
+        self.control(Operation::Control(command)).await
+    }
+
+    pub async fn upload(
+        &self,
+        peers: Vec<NoiseKey>,
+        payload: Payload,
+        slot: OwnedSemaphorePermit,
+    ) -> Reply {
+        self.control(Operation::Upload(peers, payload, slot)).await
+    }
+
+    pub async fn download(&self, offset: usize) -> Result<Option<Arc<Payload>>, String> {
+        match self.dispatch(Operation::Download(offset)).await? {
+            Output::Download(item) => Ok(item),
+            Output::Control(_) => unreachable!(),
+        }
+    }
+
+    async fn control(&self, operation: Operation) -> Reply {
+        match self.dispatch(operation).await {
+            Ok(Output::Control(reply)) => reply,
+            Ok(Output::Download(_)) => unreachable!(),
+            Err(error) => Reply::Error(error),
+        }
+    }
+
+    async fn dispatch(&self, operation: Operation) -> Result<Output, String> {
         let (tx, rx) = oneshot::channel();
-        if self.0.try_send((command, tx)).is_err() {
-            return Reply::Error("LAN worker is unavailable or busy".into());
+        if self.0.try_send((operation, tx)).is_err() {
+            return Err("LAN worker is unavailable or busy".into());
         }
         match timeout(Duration::from_secs(2), rx).await {
-            Ok(Ok(reply)) => reply,
-            _ => Reply::Error(
-                "LAN worker is busy. Check the Secret Service session and retry.".into(),
-            ),
+            Ok(Ok(reply)) => Ok(reply),
+            _ => Err("LAN worker is busy. Check the Secret Service session and retry.".into()),
         }
     }
 }
@@ -83,7 +122,9 @@ struct Activity {
     sessions: Sessions,
     hints: Hints,
     networks: LocalNetworks,
-    inbox: VecDeque<Message>,
+    inbox: Inbox,
+    incoming_bulk: Arc<Semaphore>,
+    outgoing_bulk: Arc<Semaphore>,
     clipboard: AutoClipboard,
 }
 
@@ -130,13 +171,15 @@ impl Worker {
                 sessions: Sessions::default(),
                 hints: Hints::default(),
                 networks: LocalNetworks::load(),
-                inbox: VecDeque::new(),
+                inbox: Inbox::default(),
+                incoming_bulk: Arc::new(Semaphore::new(2)),
+                outgoing_bulk: Arc::new(Semaphore::new(2)),
                 clipboard: AutoClipboard::default(),
             })),
         }
     }
 
-    async fn run(mut self, mut rx: mpsc::Receiver<(Command, oneshot::Sender<Reply>)>) {
+    async fn run(mut self, mut rx: mpsc::Receiver<(Operation, oneshot::Sender<Output>)>) {
         // Existing profiles can accept sessions as soon as the daemon starts. On first run,
         // leave local-only daemon commands usable without touching the keyring.
         if self
@@ -152,9 +195,13 @@ impl Worker {
         loop {
             tokio::select! {
                 request = rx.recv() => {
-                    let Some((command, response)) = request else { break };
+                    let Some((operation, response)) = request else { break };
                     if !response.is_closed() {
-                        let reply = self.command(command).await.unwrap_or_else(Reply::Error);
+                        let reply = match operation {
+                            Operation::Control(command) => Output::Control(self.command(command).await.unwrap_or_else(Reply::Error)),
+                            Operation::Upload(peers, payload, _slot) => Output::Control(self.upload(peers, payload).await.unwrap_or_else(Reply::Error)),
+                            Operation::Download(offset) => Output::Download(self.activity.borrow().inbox.payload(offset)),
+                        };
                         let _ = response.send(reply);
                     }
                 }
@@ -260,6 +307,48 @@ impl Worker {
         }
         self.update_discovery(endpoint).await;
         Ok(())
+    }
+
+    async fn upload(&mut self, peers: Vec<NoiseKey>, payload: Payload) -> Result<Reply, String> {
+        let endpoint = self.ensure_ready().await?;
+        let slot = self
+            .activity
+            .borrow()
+            .outgoing_bulk
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Bulk sending is busy. Retry after the current transfers.")?;
+        let batch = Arc::new(Batch {
+            payload,
+            _slot: slot,
+        });
+        let outcomes = peers
+            .into_iter()
+            .map(|peer| {
+                match sessions::queue_bulk(
+                    &self.activity,
+                    Rc::clone(&endpoint),
+                    peer,
+                    Arc::clone(&batch),
+                ) {
+                    Ok(id) => QueueOutcome::Queued(id),
+                    Err(error) => QueueOutcome::Error(
+                        error
+                            .chars()
+                            .take(48)
+                            .map(|ch| {
+                                if ch.is_ascii_graphic() || ch == ' ' {
+                                    ch
+                                } else {
+                                    '?'
+                                }
+                            })
+                            .collect(),
+                    ),
+                }
+            })
+            .collect();
+        Ok(Reply::BulkQueued(outcomes))
     }
 
     async fn command(&mut self, command: Command) -> Result<Reply, String> {
@@ -411,7 +500,7 @@ impl Worker {
                 Ok(Reply::Ok)
             }
             Command::Send { peer, text } => {
-                sessions::queue(&self.activity, endpoint, peer, text).map(Reply::Queued)
+                sessions::queue_text(&self.activity, endpoint, peer, text).map(Reply::Queued)
             }
             Command::Delivery { id } => self
                 .activity
@@ -419,8 +508,11 @@ impl Worker {
                 .sessions
                 .delivery(id)
                 .map(Reply::Delivery),
+            Command::BulkUpload { .. } | Command::BulkDownload { .. } => {
+                Err("Use the bulk stream.".into())
+            }
             Command::Received { offset } => Ok(Reply::Received(
-                self.activity.borrow().inbox.get(offset).cloned(),
+                self.activity.borrow().inbox.message(offset),
             )),
         }
     }

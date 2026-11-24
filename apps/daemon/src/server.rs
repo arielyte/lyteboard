@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     io, process,
     sync::{
         Arc,
@@ -7,14 +8,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+use lyteboard_core::bulk::{Payload, validate_size};
 use lyteboard_core::ipc::linux::{
-    Endpoint, EndpointError, FrameError, REQUEST_TIMEOUT, ServerSocket, authenticate, receive, send,
+    BULK_TIMEOUT, Endpoint, EndpointError, FrameError, REQUEST_TIMEOUT, ServerSocket, authenticate,
+    read_bulk, receive, send, write_bulk,
 };
-use lyteboard_protocol::ipc::{self, DecodeError, ErrorCode, Request, Response, Status};
+use lyteboard_protocol::{
+    ipc::{
+        self, DecodeError, ErrorCode, Request, Response, Status,
+        network::{Command, MAX_RECIPIENTS, Reply},
+    },
+    peer::{Media, NoiseKey},
+};
 use thiserror::Error;
 use tokio::{
     net::UnixStream,
     signal::unix::{SignalKind, signal},
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -45,6 +55,7 @@ pub async fn run() -> Result<(), DaemonError> {
     let started = Instant::now();
     let connections_accepted = Arc::new(AtomicU64::new(0));
     let mut handlers = JoinSet::new();
+    let bulk_slots = Arc::new(Semaphore::new(2));
     eprintln!("Lyteboard daemon ready (PID {})", process::id());
 
     let shutdown_client = loop {
@@ -68,7 +79,7 @@ pub async fn run() -> Result<(), DaemonError> {
 
                 if authenticate(&stream).is_ok() {
                     connections_accepted.fetch_add(1, Ordering::Relaxed);
-                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted), network.clone()));
+                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted), network.clone(), Arc::clone(&bulk_slots)));
                 }
             }
         }
@@ -91,6 +102,7 @@ async fn handle(
     started: Instant,
     connections_accepted: Arc<AtomicU64>,
     network: Network,
+    bulk_slots: Arc<Semaphore>,
 ) -> Option<UnixStream> {
     let response = match timeout(REQUEST_TIMEOUT, receive::<Request>(&mut stream)).await {
         Ok(Ok(Request::Ping)) => Response::Pong,
@@ -104,6 +116,41 @@ async fn handle(
         }),
         Ok(Ok(Request::GetVersion)) => Response::Version(lyteboard_core::VERSION.to_owned()),
         Ok(Ok(Request::Shutdown)) => return Some(stream),
+        Ok(Ok(Request::Network(Command::BulkUpload { peers, media, size }))) => {
+            let reply = match bulk_slots.try_acquire_owned() {
+                Ok(slot) => upload(&mut stream, &network, peers, media, size, slot).await,
+                Err(_) => Reply::Error("Local bulk transfers are busy.".into()),
+            };
+            Response::Network(reply)
+        }
+        Ok(Ok(Request::Network(Command::BulkDownload { offset }))) => {
+            let Ok(_slot) = bulk_slots.try_acquire_owned() else {
+                let reply =
+                    Response::Network(Reply::Error("Local bulk transfers are busy.".into()));
+                let _ = timeout(REQUEST_TIMEOUT, send(&mut stream, &reply)).await;
+                return None;
+            };
+            let (reply, item) = match network.download(offset).await {
+                Ok(Some(item)) => (
+                    Reply::BulkItem {
+                        media: item.media(),
+                        size: item.bytes().len() as u32,
+                    },
+                    Some(item),
+                ),
+                Ok(None) => (Reply::NoBulkItem, None),
+                Err(error) => (Reply::Error(error), None),
+            };
+            let _ = timeout(BULK_TIMEOUT, async {
+                send(&mut stream, &Response::Network(reply)).await?;
+                if let Some(item) = item {
+                    write_bulk(&mut stream, item.bytes()).await?;
+                }
+                Ok::<(), io::Error>(())
+            })
+            .await;
+            return None;
+        }
         Ok(Ok(Request::Network(command))) => Response::Network(network.request(command).await),
         Ok(Err(FrameError::Length(0) | FrameError::Decode(DecodeError::Invalid(_)))) => {
             Response::Error(ErrorCode::InvalidRequest)
@@ -117,4 +164,47 @@ async fn handle(
 
     let _ = timeout(REQUEST_TIMEOUT, send(&mut stream, &response)).await;
     None
+}
+
+async fn upload(
+    stream: &mut UnixStream,
+    network: &Network,
+    peers: Vec<String>,
+    media: Media,
+    size: u32,
+    slot: OwnedSemaphorePermit,
+) -> Reply {
+    let operation = async {
+        validate_size(media, size as usize).map_err(|error| error.to_string())?;
+        if peers.is_empty() || peers.len() > MAX_RECIPIENTS {
+            return Err("Specify one to 32 paired devices.".into());
+        }
+        let mut unique = BTreeSet::new();
+        let peers = peers
+            .into_iter()
+            .map(|id| {
+                let mut peer: NoiseKey = [0; 32];
+                if hex::decode_to_slice(id, &mut peer).is_err() || !unique.insert(peer) {
+                    return Err("Invalid or duplicate device ID.");
+                }
+                Ok(peer)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        send(stream, &Response::Network(Reply::BulkReady))
+            .await
+            .map_err(|_| "Local bulk stream closed.")?;
+        let bytes = read_bulk(stream, media, size)
+            .await
+            .map_err(|_| "Local bulk stream was truncated or exceeded its declared length.")?;
+        let payload = Payload::validate(media, bytes, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(network.upload(peers, payload, slot).await)
+    };
+    match timeout(BULK_TIMEOUT, operation).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) => Reply::Error(error),
+        Err(_) => Reply::Error("Local bulk upload timed out.".into()),
+    }
 }
