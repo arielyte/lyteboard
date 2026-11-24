@@ -28,7 +28,7 @@ flowchart LR
 | Device trust (`crates/core`) | Peer records, local approval, revocation, and lookup by pinned identity. The daemon owns the records on desktop. |
 | Networking | Open one ordered TCP stream per peer session. Bound connection admission, frame lengths, and deadlines. |
 | Synchronization (`crates/core`) | Explicit selection of recipients, opt-in automatic capture, reconnect backoff, duplicate suppression, and clipboard loop prevention. |
-| Clipboard adapters | Linux X11 and Wayland, Windows, and Android provide platform-specific clipboard operations. Capabilities can differ between sessions. |
+| Clipboard adapters | Linux uses wl-clipboard on Wayland and xclip on X11 for text. Windows and Android adapters remain planned. |
 | Storage | Linux profiles keep trust metadata in a private versioned snapshot and identity seeds in Secret Service. Optional history storage and daemon ownership are planned. |
 | User interfaces (`apps/`) | CLI and GUI present status and request operations from the daemon. Kotlin presents Android actions and passes input through the FFI boundary. |
 
@@ -56,4 +56,5 @@ Prefer event-driven clipboard notifications where supported, idle waits, and bou
 | **LAN-2A · Durable identity and trust** | Store credentials in Linux Secret Service. Reload active pins, dial hints, and revocations from a private profile. Verify a fresh authenticated session after reopening it. |
 | **LAN-2B · Daemon and CLI** | Load the durable profile in the daemon. Expose pairing, trust management, and acknowledged test text through local CLI commands. Verify independent daemon processes over TCP. |
 | **LAN-3 · Discovery and reconnection** | Browse and advertise on the local network, accept manual on-link address hints, and reconnect to active pins with bounded backoff. Verify Noise authentication, duplicate handling, and withdrawal on shutdown. |
-| **Later · Clipboard** | Add bounded image streaming, private local history, and clipboard adapters. |
+| **LAN-4A · Linux clipboard text** | Send one explicitly read clipboard snapshot to selected peers. Apply received text locally on request or with opt-in auto-apply. |
+| **Later · Clipboard** | Add bounded image streaming and private local history. |

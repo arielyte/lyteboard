@@ -68,6 +68,7 @@ pub async fn run(command: Command) -> Result<(), CommandError> {
             client.shutdown().await?;
             println!("Daemon stopped");
         }
+        Command::Clipboard { command } => super::clipboard::run(&client, command).await?,
         command => super::network::run(&client, command).await?,
     }
     Ok(())

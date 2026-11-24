@@ -26,6 +26,12 @@ The Linux daemon uses mDNS to advertise `_lyteboard._tcp.local.` with its listen
 
 One daemon scheduler reconnects paired peers with saved or discovered addresses. It permits four outbound handshakes at once, retries with jittered exponential delays between 0.5 and 60 seconds, and rotates address candidates after failures. If both peers dial at once, confirmed competing sockets converge on the connection initiated by the lower public key. Failed or unacknowledged messages are not resent automatically.
 
+## LAN-4A checkpoint
+
+The Linux CLI can read the current text clipboard, send one snapshot to selected paired devices, and copy received text into the local clipboard. On Wayland it uses `wl-paste` and `wl-copy` from `wl-clipboard` 2.3 or newer. KDE Plasma works with KWin's data-control support. On X11 it uses `xclip` and the `CLIPBOARD` selection. Explicit operations use the CLI's graphical session. Auto-apply uses the daemon's graphical environment, starts off, and resets at daemon restart.
+
+All clipboard transfers use the existing authenticated delivery and the 4 KiB IPC framing. The current limit is **512 UTF-8 bytes per message**. Empty, non-text, oversized, and invalid text are rejected with errors. The clipboard is only read for an explicit send. Applying a received message does not trigger any outbound action. A slow automatic writer coalesces pending writes to the latest text. Clipboard commands and helper errors do not log payloads.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -134,22 +140,64 @@ b send "$alpha_id" 'Manual fallback'
 
 For a restart-persistent discovery opt-out, set `LYTEBOARD_DISCOVERY=off` in the daemon's environment. The CLI toggle applies to the running daemon. Loopback listeners leave multicast paused.
 
+## Manual clipboard demonstration
+
+Start each daemon from its graphical session and pair the devices using the steps above. Use separate graphical sessions to compare selections independently. On the sending device, enter a peer ID shown by `devices list` and seed a short synthetic value:
+
+```bash
+lyteboard daemon start
+lyteboard devices list
+read -r -p 'Paired device ID: ' peer_id
+printf 'Lyteboard test ✓\n' | wl-copy --type 'text/plain;charset=utf-8' --sensitive
+lyteboard clipboard send "$peer_id"
+```
+
+On the receiver, check the default and copy the newest received text. On Wayland, compare its bytes without printing the clipboard:
+
+```bash
+lyteboard clipboard auto
+lyteboard clipboard copy
+wl-paste --no-newline --type text | cmp - <(printf 'Lyteboard test ✓\n')
+lyteboard clipboard auto on
+```
+
+Send a different value from the first device and compare again on the receiver. Use `lyteboard clipboard auto off` to disable automatic writes, or `lyteboard clipboard copy --index 2` to copy the second-newest message when available. For multiple recipients, use `lyteboard clipboard send "$peer_id" "$other_peer_id"`, with each ID from `devices list`. The CLI reports how many devices acknowledged the text.
+
+For an X11 session, replace the Wayland seed and check with:
+
+```bash
+printf 'Lyteboard test ✓\n' | xclip -selection clipboard -in -target UTF8_STRING -silent
+xclip -selection clipboard -out -target UTF8_STRING | cmp - <(printf 'Lyteboard test ✓\n')
+```
+
 ## Verification
 
 ```sh
 cargo build --locked -p lyteboard-daemon -p lyteboard-cli
 python3 apps/daemon/tests/lan_cli.py
 cargo test --locked -p lyteboard-daemon --bin lyteboardd network::
-cargo test --locked -p lyteboard-protocol network_payloads
-cargo test --locked --workspace
 ```
 
 - **Simulated discovery:** Rust tests feed synthetic resolved/removed records to the cache and cover malformed, self, loopback, broadcast, and off-link advertisements. They also check retry bounds and deterministic duplicate-session selection.
 - **Real TCP, multicast disabled:** the process harness verifies manual fallback after an IP change, rejects an address serving a different Noise identity, and tests persistent trust, revocation, and shutdown.
 - **Actual multicast:** the same harness exercises on-host multicast across real LAN interfaces. It checks discovery before pairing, withdrawal on disable and shutdown, and automatic reconnection after a listener address change with the same saved identity. Separate physical hosts were not used.
 
-Both process modes, all four focused LAN-3 tests, the IPC payload test, and all 67 workspace tests passed on Linux. Formatting, Clippy for the daemon, CLI, core, and protocol with warnings denied, and `git diff --check` passed.
+Clipboard-focused verification from the repository root after building the CLI and daemon:
+
+```sh
+cargo test --locked -p lyteboard-core --lib clipboard::
+cargo test --locked -p lyteboard-protocol network_payloads
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin --x11
+cargo test --locked --workspace
+```
+
+- **Simulated adapters:** temporary Wayland and X11 helpers with real daemon TCP and IPC verified empty input, Unicode, the byte boundary, multiple recipients, explicit and automatic writes, and absence of rebroadcast. Failure tests verified actionable messages and discarded helper diagnostics.
+- **Real graphical selections:** the harness uses separate virtual KWin sessions, with optional nested Xwayland displays. The clipboard selections are isolated from the primary desktop. Testing uses synthetic text and real clipboard read and write utilities.
+
+All three clipboard harness modes passed, including real Wayland with wl-clipboard 2.3.0 and real Xwayland with xclip 0.13. The existing loopback LAN process test and all 69 workspace tests passed. Formatting, focused Clippy with warnings denied, and `git diff --check` passed.
 
 ## Remaining work
 
-Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Test text is limited to 512 UTF-8 bytes, and each daemon keeps up to 16 recent messages in memory. Clipboard integration, images, local history, and GUI peer controls remain pending.
+Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. The 512-byte text ceiling stays in place until a larger transfer path is implemented. The daemon retains its existing 16 recent received messages in memory. The compositor or clipboard manager can maintain its own clipboard history. Restart the daemon from the graphical session if automatic writes cannot reach the display. Images, persistent clipboard history, continuous clipboard monitoring, and GUI peer controls remain pending.

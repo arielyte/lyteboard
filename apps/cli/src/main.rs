@@ -3,6 +3,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 #[cfg(target_os = "linux")]
+mod clipboard;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod network;
@@ -51,6 +53,12 @@ enum Command {
         #[arg(value_parser = network::parse_key)]
         device: [u8; 32],
         text: String,
+    },
+    /// Send or apply text from the Linux clipboard.
+    #[cfg(target_os = "linux")]
+    Clipboard {
+        #[command(subcommand)]
+        command: clipboard::ClipboardCommand,
     },
     /// Show recent received test messages.
     #[cfg(target_os = "linux")]

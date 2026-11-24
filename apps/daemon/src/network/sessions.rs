@@ -405,6 +405,7 @@ async fn run_channel(
                                 if state.inbox.len() == INBOX_LIMIT {
                                     state.inbox.pop_back();
                                 }
+                                state.clipboard.received(&text);
                                 state.inbox.push_front(Message { peer, text });
                             }
                             session.acknowledge(id).await.map_err(lan_error)?;

@@ -28,6 +28,8 @@ pub enum Command {
     Send { peer: NoiseKey, text: String },
     Delivery { id: u64 },
     Received { offset: usize },
+    ClipboardAutoStatus,
+    SetClipboardAuto { enabled: bool },
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +55,10 @@ pub enum Reply {
     Queued(u64),
     Delivery(Delivery),
     Received(Option<Message>),
+    ClipboardAuto {
+        enabled: bool,
+        last_error: Option<String>,
+    },
 }
 
 impl fmt::Debug for Command {
@@ -170,6 +176,10 @@ mod tests {
             more: true,
         });
         assert!(encode(&discovered).unwrap().len() <= MAX_FRAME_BYTES);
+        let auto = Request::Network(Command::SetClipboardAuto { enabled: true });
+        let auto_frame = encode(&auto).unwrap();
+        assert!(auto_frame.len() < MAX_FRAME_BYTES);
+        assert_eq!(decode::<Request>(&auto_frame).unwrap(), auto);
         let qr = Request::Network(Command::Accept {
             qr: "private-qr".into(),
         });

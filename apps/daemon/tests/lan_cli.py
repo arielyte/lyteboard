@@ -117,6 +117,26 @@ def stop_bus(bus):
     bus.stdout.close()
 
 
+def isolated_keyring(root, cleanup):
+    for name in ("run", "data", "config"):
+        (root / name).mkdir(mode=0o700)
+    bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork",
+                            f"--address=unix:path={root / 'bus'}", "--print-address=1"],
+                           stdout=subprocess.PIPE, text=True)
+    cleanup.callback(stop_bus, bus)
+    address = bus.stdout.readline().strip()
+    assert address.startswith(f"unix:path={root / 'bus'}")
+    keyring_env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=address,
+                       XDG_RUNTIME_DIR=str(root / "run"),
+                       XDG_DATA_HOME=str(root / "data"), XDG_CONFIG_HOME=str(root / "config"))
+    keyring_env.pop("GNOME_KEYRING_CONTROL", None)
+    subprocess.run(["gnome-keyring-daemon", "--unlock", "--components=secrets",
+                    f"--control-directory={root / 'run' / 'keyring'}"],
+                   env=keyring_env, input="disposable-lyteboard-test-password",
+                   text=True, stdout=subprocess.DEVNULL, check=True, timeout=10)
+    return keyring_env
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--multicast", metavar="LAN_IPV4", help="exercise actual mDNS on this local interface")
@@ -127,22 +147,7 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="lyteboard-lan-cli-") as directory, ExitStack() as cleanup:
         root = Path(directory)
-        for name in ("run", "data", "config"):
-            (root / name).mkdir(mode=0o700)
-        bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork",
-                                f"--address=unix:path={root / 'bus'}", "--print-address=1"],
-                               stdout=subprocess.PIPE, text=True)
-        cleanup.callback(stop_bus, bus)
-        address = bus.stdout.readline().strip()
-        assert address.startswith(f"unix:path={root / 'bus'}")
-        keyring_env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=address,
-                           XDG_RUNTIME_DIR=str(root / "run"),
-                           XDG_DATA_HOME=str(root / "data"), XDG_CONFIG_HOME=str(root / "config"))
-        keyring_env.pop("GNOME_KEYRING_CONTROL", None)
-        subprocess.run(["gnome-keyring-daemon", "--unlock", "--components=secrets",
-                        f"--control-directory={root / 'run' / 'keyring'}"],
-                       env=keyring_env, input="disposable-lyteboard-test-password",
-                       text=True, stdout=subprocess.DEVNULL, check=True, timeout=10)
+        keyring_env = isolated_keyring(root, cleanup)
         alpha, beta, gamma = (Device(root, name, keyring_env) for name in ("Alpha", "Beta", "Gamma"))
         for device in (alpha, beta, gamma):
             cleanup.callback(device.stop)

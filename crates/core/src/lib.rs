@@ -1,5 +1,7 @@
 //! Shared Lyteboard application and platform integration code.
 
+#[cfg(target_os = "linux")]
+pub mod clipboard;
 pub mod ipc;
 pub mod peer;
 

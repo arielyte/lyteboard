@@ -1,5 +1,6 @@
 //! The LAN worker owns peer state and runs away from the authenticated IPC runtime.
 
+mod clipboard;
 mod discovery;
 mod sessions;
 
@@ -8,6 +9,7 @@ use std::{
     sync::Arc, time::Duration,
 };
 
+use lyteboard_core::clipboard::Clipboard;
 use lyteboard_core::peer::{
     CredentialError, Endpoint, PairingStatus,
     lan::{self, Incoming, Listener, PendingPair},
@@ -27,6 +29,7 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+use clipboard::AutoClipboard;
 use discovery::{Discovery, Hints, LocalNetworks};
 use sessions::Sessions;
 
@@ -81,6 +84,7 @@ struct Activity {
     hints: Hints,
     networks: LocalNetworks,
     inbox: VecDeque<Message>,
+    clipboard: AutoClipboard,
 }
 
 struct PairJob {
@@ -127,6 +131,7 @@ impl Worker {
                 hints: Hints::default(),
                 networks: LocalNetworks::load(),
                 inbox: VecDeque::new(),
+                clipboard: AutoClipboard::default(),
             })),
         }
     }
@@ -263,9 +268,32 @@ impl Worker {
             self.bind(Some(address), &endpoint).await?;
             return self.status();
         }
+        match command {
+            Command::ClipboardAutoStatus => return Ok(self.activity.borrow().clipboard.status()),
+            Command::SetClipboardAuto { enabled: false } => {
+                self.activity.borrow_mut().clipboard.disable();
+                return Ok(self.activity.borrow().clipboard.status());
+            }
+            Command::SetClipboardAuto { enabled: true } => {
+                if !self.activity.borrow().clipboard.is_enabled() {
+                    let clipboard = Clipboard::for_session().map_err(|error| {
+                        format!("{error} Restart lyteboardd from that graphical session to enable automatic writes.")
+                    })?;
+                    clipboard
+                        .check_writer()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    self.activity.borrow_mut().clipboard.enable(clipboard);
+                }
+                return Ok(self.activity.borrow().clipboard.status());
+            }
+            _ => {}
+        }
         let endpoint = self.ensure_ready().await?;
         match command {
-            Command::Listen { .. } => unreachable!(),
+            Command::Listen { .. }
+            | Command::ClipboardAutoStatus
+            | Command::SetClipboardAuto { .. } => unreachable!(),
             Command::Status => self.status(),
             Command::SetDiscovery { enabled } => {
                 self.discovery_enabled = enabled;

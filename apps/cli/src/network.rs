@@ -277,14 +277,7 @@ async fn list_discovered(client: &Client) -> Result<(), CommandError> {
 }
 
 async fn send_text(client: &Client, peer: [u8; 32], text: String) -> Result<(), CommandError> {
-    if text.is_empty() || text.len() > MAX_TEST_TEXT_BYTES || text.contains('\0') {
-        return Err(CommandError::Network(format!(
-            "Text must be 1–{MAX_TEST_TEXT_BYTES} UTF-8 bytes without NUL."
-        )));
-    }
-    let Reply::Queued(id) = request(client, Request::Send { peer, text }).await? else {
-        return Err(unexpected());
-    };
+    let id = queue_text(client, peer, text).await?;
     timeout(Duration::from_secs(30), async {
         loop {
             match request(client, Request::Delivery { id }).await? {
@@ -304,7 +297,23 @@ async fn send_text(client: &Client, peer: [u8; 32], text: String) -> Result<(), 
     .map_err(|_| CommandError::Network("Delivery was not confirmed in time.".into()))?
 }
 
-async fn request(client: &Client, command: Request) -> Result<Reply, CommandError> {
+pub(crate) async fn queue_text(
+    client: &Client,
+    peer: [u8; 32],
+    text: String,
+) -> Result<u64, CommandError> {
+    if text.is_empty() || text.len() > MAX_TEST_TEXT_BYTES || text.contains('\0') {
+        return Err(CommandError::Network(format!(
+            "Text must be 1–{MAX_TEST_TEXT_BYTES} UTF-8 bytes without NUL."
+        )));
+    }
+    let Reply::Queued(id) = request(client, Request::Send { peer, text }).await? else {
+        return Err(unexpected());
+    };
+    Ok(id)
+}
+
+pub(crate) async fn request(client: &Client, command: Request) -> Result<Reply, CommandError> {
     match client.network(command).await? {
         Reply::Error(error) => Err(CommandError::Network(error)),
         reply => Ok(reply),
@@ -319,7 +328,7 @@ fn expect_ok(reply: Reply) -> Result<(), CommandError> {
     }
 }
 
-fn unexpected() -> CommandError {
+pub(crate) fn unexpected() -> CommandError {
     CommandError::Network("Unexpected response from the LAN worker.".into())
 }
 
