@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 use lyteboard_protocol::peer::{
-    Context, FrameKind, MAX_TEXT_BYTES, Path, PeerFailure, Record, RouteId, RoutedFrame,
+    FrameKind, MAX_TEXT_BYTES, Path, PeerFailure, Record, RouteId, RoutedFrame,
 };
 use zeroize::Zeroizing;
 
 use super::{
-    Endpoint, Error, HANDSHAKE_TIMEOUT, Lease, Slot, State, Time,
+    Endpoint, Error, HANDSHAKE_TIMEOUT, Lease, PeerContext, Slot, State, Time,
     crypto::{Handshake, Transport},
     random, within,
 };
@@ -22,6 +22,9 @@ impl Endpoint {
     ) -> Result<(Session<'_>, RoutedFrame), Error> {
         let mut state = self.state_at(now)?;
         let pin = state.trust.active(&to).ok_or(Error::Untrusted)?.noise_key;
+        if path == Path::DirectTcp && pin != to {
+            return Err(Error::Untrusted);
+        }
         let slot = Slot {
             route: to,
             initiator: true,
@@ -29,16 +32,20 @@ impl Endpoint {
         state.check_capacity(slot)?;
         let mut channel = [0; 16];
         random(&mut channel)?;
-        let context = Context {
-            origin: self.origin.clone(),
+        let context = PeerContext {
             path,
             channel,
-            initiator: self.route_id(),
+            initiator: self.peer_id(path),
             responder: to,
             invite: None,
         };
-        let mut handshake =
-            Handshake::new(&self.identity, true, &context.encode()?, Some(&pin), None)?;
+        let mut handshake = Handshake::new(
+            &self.identity,
+            true,
+            &self.encode_context(&context)?,
+            Some(&pin),
+            None,
+        )?;
         let first = self.frame(&context, true, FrameKind::SessionOpen, handshake.write()?);
         let id = state.reserve(slot, now, None)?;
         Ok((
@@ -66,12 +73,14 @@ impl Endpoint {
         first.validate()?;
         let mut state = self.state_at(now)?;
         let pin = state.trust.active(&from).ok_or(Error::Untrusted)?.noise_key;
-        let context = Context {
-            origin: self.origin.clone(),
+        if path == Path::DirectTcp && pin != from {
+            return Err(Error::Untrusted);
+        }
+        let context = PeerContext {
             path,
             channel: first.channel,
             initiator: from,
-            responder: self.route_id(),
+            responder: self.peer_id(path),
             invite: None,
         };
         self.receive_frame(&context, false, from, &first, FrameKind::SessionOpen)?;
@@ -80,8 +89,13 @@ impl Endpoint {
             initiator: false,
         };
         state.check_capacity(slot)?;
-        let mut handshake =
-            Handshake::new(&self.identity, false, &context.encode()?, Some(&pin), None)?;
+        let mut handshake = Handshake::new(
+            &self.identity,
+            false,
+            &self.encode_context(&context)?,
+            Some(&pin),
+            None,
+        )?;
         handshake.read(&first.body)?;
         let reply = self.frame(&context, false, FrameKind::Handshake, handshake.write()?);
         let (_, remote, transport) = handshake.finish()?;
@@ -107,7 +121,7 @@ impl Endpoint {
 
 pub struct Session<'a> {
     lease: Option<Lease<'a>>,
-    context: Context,
+    context: PeerContext,
     started: Time,
     phase: Option<Phase>,
 }
@@ -328,7 +342,7 @@ impl Session<'_> {
 
 fn encrypt(
     lease: &Lease<'_>,
-    context: &Context,
+    context: &PeerContext,
     transport: &mut Transport,
     record: Record,
 ) -> Result<RoutedFrame, Error> {

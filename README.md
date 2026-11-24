@@ -2,7 +2,7 @@
 
 Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Linux is the first target, with Windows and a Kotlin Android companion planned.
 
-Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared by the CLI and the desktop window. The shared Rust core has in-process pairing and encrypted sessions. Direct TCP, clipboard integration, automatic reconnection, and local history are planned. [Development state](docs/DEV_STATE.md)
+Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared by the CLI and the desktop window. The Rust core supports pairing and encrypted text over direct TCP in a development harness. Daemon integration, automatic reconnection, clipboard sharing, and local history are planned. [Development state](docs/DEV_STATE.md)
 
 ## Repository layout
 

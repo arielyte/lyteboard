@@ -32,7 +32,7 @@ flowchart LR
 | Storage | One local database per endpoint for trust metadata and optional history. Keep private keys in OS credential storage. The desktop daemon owns local persistence. |
 | User interfaces (`apps/`) | CLI and GUI present status and request operations from the daemon. Kotlin presents Android actions and passes input through the FFI boundary. |
 
-Phase 2B implements in-process pairing and confirmed sessions in the existing crates. The daemon will own peer networking on desktop. The standalone CLI and Tauri frontend use the daemon instead of opening their own peer connections. Kotlin uses a small, typed UniFFI interface to the Rust core. Peer transport limits and trust decisions stay in Rust. [Security design](security.md), [Wire protocol](protocol.md)
+Phase 2B implements in-process pairing and confirmed sessions. LAN-1 runs those state machines over direct TCP in the Rust core with in-memory trust. The daemon will own peer networking on desktop. The standalone CLI and Tauri frontend use the daemon instead of opening their own peer connections. Kotlin uses a small, typed UniFFI interface to the Rust core. Peer transport limits and trust decisions stay in Rust. [Security design](security.md), [Wire protocol](protocol.md)
 
 ## Trust and privacy
 

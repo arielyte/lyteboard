@@ -2,6 +2,7 @@
 
 mod crypto;
 mod identity;
+pub mod lan;
 mod pairing;
 mod session;
 mod trust;
@@ -12,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use lyteboard_protocol::peer::{Context, FrameKind, Origin, RouteId, RoutedFrame, WireError};
+use lyteboard_protocol::peer::{
+    ChannelId, Context, FrameKind, InviteId, Origin, Path, RouteId, RoutedFrame, WireError,
+    lan_prologue,
+};
 use thiserror::Error;
 
 pub use crypto::CryptoError;
@@ -62,7 +66,7 @@ pub enum Error {
 
 pub struct Endpoint {
     identity: DeviceIdentity,
-    origin: Origin,
+    origin: Option<Origin>,
     state: Mutex<State>,
 }
 
@@ -70,9 +74,45 @@ impl Endpoint {
     pub fn new(identity: DeviceIdentity, origin: Origin) -> Self {
         Self {
             identity,
-            origin,
+            origin: Some(origin),
             state: Mutex::default(),
         }
+    }
+
+    pub fn new_lan(identity: DeviceIdentity) -> Self {
+        Self {
+            identity,
+            origin: None,
+            state: Mutex::default(),
+        }
+    }
+
+    fn peer_id(&self, path: Path) -> RouteId {
+        if path == Path::DirectTcp {
+            self.noise_key()
+        } else {
+            self.route_id()
+        }
+    }
+
+    fn encode_context(&self, context: &PeerContext) -> Result<Vec<u8>, Error> {
+        if context.path == Path::DirectTcp {
+            return Ok(lan_prologue(
+                &context.channel,
+                &context.initiator,
+                &context.responder,
+                context.invite.as_ref(),
+            )?);
+        }
+        Ok(Context {
+            origin: self.origin.clone().ok_or(Error::Unexpected)?,
+            path: context.path,
+            channel: context.channel,
+            initiator: context.initiator,
+            responder: context.responder,
+            invite: context.invite,
+        }
+        .encode()?)
     }
 
     pub fn route_id(&self) -> RouteId {
@@ -145,7 +185,7 @@ impl Endpoint {
 
     fn frame(
         &self,
-        context: &Context,
+        context: &PeerContext,
         initiator: bool,
         kind: FrameKind,
         body: Vec<u8>,
@@ -165,14 +205,14 @@ impl Endpoint {
 
     fn receive_frame(
         &self,
-        context: &Context,
+        context: &PeerContext,
         initiator: bool,
         from: RouteId,
         frame: &RoutedFrame,
         kind: FrameKind,
     ) -> Result<(), Error> {
         frame.validate()?;
-        if frame.to != self.route_id()
+        if frame.to != self.peer_id(context.path)
             || from != remote_route(context, initiator)
             || frame.channel != context.channel
             || frame.kind != kind
@@ -183,7 +223,15 @@ impl Endpoint {
     }
 }
 
-fn remote_route(context: &Context, initiator: bool) -> RouteId {
+struct PeerContext {
+    path: Path,
+    channel: ChannelId,
+    initiator: RouteId,
+    responder: RouteId,
+    invite: Option<InviteId>,
+}
+
+fn remote_route(context: &PeerContext, initiator: bool) -> RouteId {
     if initiator {
         context.responder
     } else {

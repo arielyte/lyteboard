@@ -1,13 +1,13 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::SocketAddr, time::Duration};
 
 use lyteboard_protocol::peer::{
-    Context, FrameKind, Invite, InviteId, Path, QrCode, Record, RouteId, RoutedFrame,
+    FrameKind, Invite, InviteId, LanInvite, NoiseKey, Path, QrCode, Record, RouteId, RoutedFrame,
     route_proof_message, validate_label,
 };
 use zeroize::Zeroizing;
 
 use super::{
-    Endpoint, Error, HANDSHAKE_TIMEOUT, Lease, Slot, State, Time, TrustedDevice,
+    Endpoint, Error, HANDSHAKE_TIMEOUT, Lease, PeerContext, Slot, State, Time, TrustedDevice,
     crypto::{Handshake, Transport},
     identity::{valid_route, verify_route},
     random, remote_route, within,
@@ -20,7 +20,8 @@ pub(super) struct LocalInvite {
     id: InviteId,
     created: Time,
     expires_at: u64,
-    available: Option<Invite>,
+    path: Path,
+    available: Option<Zeroizing<[u8; 32]>>,
     pub(super) reserved_by: Option<u64>,
 }
 
@@ -34,9 +35,30 @@ impl LocalInvite {
     }
 }
 
+struct PairTarget<'a> {
+    path: Path,
+    route: RouteId,
+    key: NoiseKey,
+    id: InviteId,
+    psk: &'a [u8; 32],
+    expires_at: u64,
+}
+
 impl Endpoint {
     /// Issue one new invitation. Keep the returned QR text in a trusted display or import channel.
     pub fn create_invite(&self, now: Time) -> Result<QrCode, Error> {
+        self.issue_invite(None, now)
+    }
+
+    pub(super) fn create_lan_invite(
+        &self,
+        address: SocketAddr,
+        now: Time,
+    ) -> Result<QrCode, Error> {
+        self.issue_invite(Some(address), now)
+    }
+
+    fn issue_invite(&self, address: Option<SocketAddr>, now: Time) -> Result<QrCode, Error> {
         let mut state = self.state_at(now)?;
         if state.invite.is_some() {
             return Err(Error::Invitation);
@@ -49,20 +71,39 @@ impl Endpoint {
             .unix_seconds
             .checked_add(INVITE_TTL.as_secs())
             .ok_or(Error::Expired)?;
-        let invite = Invite::new(
-            self.origin.clone(),
-            id,
-            psk,
-            self.noise_key(),
-            self.route_id(),
-            expires_at,
-        );
-        let qr = invite.encode_qr();
+        let (path, qr) = if let Some(address) = address {
+            (
+                Path::DirectTcp,
+                LanInvite::new(
+                    address,
+                    id,
+                    Zeroizing::new(*psk),
+                    self.noise_key(),
+                    expires_at,
+                )?
+                .encode_qr(),
+            )
+        } else {
+            let origin = self.origin.clone().ok_or(Error::Unexpected)?;
+            (
+                Path::Relay,
+                Invite::new(
+                    origin,
+                    id,
+                    Zeroizing::new(*psk),
+                    self.noise_key(),
+                    self.route_id(),
+                    expires_at,
+                )
+                .encode_qr(),
+            )
+        };
         state.invite = Some(LocalInvite {
             id,
             created: now,
             expires_at,
-            available: Some(invite),
+            path,
+            available: Some(psk),
             reserved_by: None,
         });
         Ok(qr)
@@ -80,12 +121,51 @@ impl Endpoint {
         now: Time,
     ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
         let invite = Invite::decode_qr(qr)?;
+        if self.origin.as_ref() != Some(&invite.origin) || !valid_route(&invite.route) {
+            return Err(Error::Invitation);
+        }
+        self.begin_pairing_with(
+            PairTarget {
+                path: Path::Relay,
+                route: invite.route,
+                key: invite.noise_key,
+                id: invite.id,
+                psk: invite.psk(),
+                expires_at: invite.expires_at,
+            },
+            label,
+            now,
+        )
+    }
+
+    pub(super) fn begin_lan_pairing(
+        &self,
+        invite: &LanInvite,
+        label: &str,
+        now: Time,
+    ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
+        self.begin_pairing_with(
+            PairTarget {
+                path: Path::DirectTcp,
+                route: invite.noise_key,
+                key: invite.noise_key,
+                id: invite.id,
+                psk: invite.psk(),
+                expires_at: invite.expires_at,
+            },
+            label,
+            now,
+        )
+    }
+
+    fn begin_pairing_with(
+        &self,
+        invite: PairTarget<'_>,
+        label: &str,
+        now: Time,
+    ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
         validate_label(label)?;
-        if invite.origin != self.origin
-            || invite.route == self.route_id()
-            || invite.noise_key == self.noise_key()
-            || !valid_route(&invite.route)
-        {
+        if invite.route == self.peer_id(invite.path) || invite.key == self.noise_key() {
             return Err(Error::Invitation);
         }
         let skew_deadline = invite.expires_at.saturating_add(CLOCK_SKEW);
@@ -99,11 +179,10 @@ impl Endpoint {
         }
         let mut channel = [0; 16];
         random(&mut channel)?;
-        let context = Context {
-            origin: self.origin.clone(),
-            path: Path::Relay,
+        let context = PeerContext {
+            path: invite.path,
             channel,
-            initiator: self.route_id(),
+            initiator: self.peer_id(invite.path),
             responder: invite.route,
             invite: Some(invite.id),
         };
@@ -116,9 +195,9 @@ impl Endpoint {
         let mut handshake = Handshake::new(
             &self.identity,
             true,
-            &context.encode()?,
-            Some(&invite.noise_key),
-            Some(invite.psk()),
+            &self.encode_context(&context)?,
+            Some(&invite.key),
+            Some(invite.psk),
         )?;
         let first = self.frame(&context, true, FrameKind::PairingOpen, handshake.write()?);
         let id = state.reserve(slot, now, Some(skew_deadline))?;
@@ -131,7 +210,7 @@ impl Endpoint {
                 }),
                 context,
                 started: now,
-                scanner_limit: Some((skew_deadline, invite.noise_key)),
+                scanner_limit: Some((skew_deadline, invite.key)),
                 label: label.into(),
                 phase: Some(Phase::Handshake(handshake)),
                 status: PairingStatus::InProgress,
@@ -147,12 +226,23 @@ impl Endpoint {
         label: &str,
         now: Time,
     ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
+        self.accept_pairing_with(Path::Relay, from, first, label, now)
+    }
+
+    pub(super) fn accept_pairing_with(
+        &self,
+        path: Path,
+        from: RouteId,
+        first: RoutedFrame,
+        label: &str,
+        now: Time,
+    ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
         first.validate()?;
         validate_label(label)?;
         if first.kind != FrameKind::PairingOpen
-            || first.to != self.route_id()
-            || from == self.route_id()
-            || !valid_route(&from)
+            || first.to != self.peer_id(path)
+            || from == self.peer_id(path)
+            || (path == Path::Relay && !valid_route(&from))
         {
             return Err(Error::Invitation);
         }
@@ -160,15 +250,16 @@ impl Endpoint {
         let invite = state
             .invite
             .as_ref()
-            .filter(|invite| first.selector == Some(invite.id) && invite.valid(now))
+            .filter(|invite| {
+                invite.path == path && first.selector == Some(invite.id) && invite.valid(now)
+            })
             .and_then(|invite| invite.available.as_ref())
             .ok_or(Error::Invitation)?;
-        let context = Context {
-            origin: self.origin.clone(),
-            path: Path::Relay,
+        let context = PeerContext {
+            path,
             channel: first.channel,
             initiator: from,
-            responder: self.route_id(),
+            responder: self.peer_id(path),
             invite: first.selector,
         };
         let slot = Slot {
@@ -179,9 +270,9 @@ impl Endpoint {
         let mut handshake = Handshake::new(
             &self.identity,
             false,
-            &context.encode()?,
+            &self.encode_context(&context)?,
             None,
-            Some(invite.psk()),
+            Some(invite),
         )?;
         handshake.read(&first.body)?;
         // Only an authenticated first flight consumes the invitation. Keep the lock across both actions.
@@ -245,7 +336,7 @@ impl fmt::Debug for VerificationCode {
 
 pub struct Pairing<'a> {
     lease: Option<Lease<'a>>,
-    context: Context,
+    context: PeerContext,
     started: Time,
     scanner_limit: Option<(u64, [u8; 32])>,
     label: String,
@@ -338,6 +429,7 @@ impl Pairing<'_> {
                 let (hash, noise_key, transport) = handshake.finish()?;
                 if noise_key == endpoint.noise_key()
                     || self.scanner_limit.is_some_and(|(_, pin)| noise_key != pin)
+                    || (self.context.path == Path::DirectTcp && noise_key != from)
                 {
                     return Err(Error::Authentication);
                 }
@@ -350,14 +442,19 @@ impl Pairing<'_> {
                     label: None,
                     step: Step::Hello,
                 };
-                let proof_message = Zeroizing::new(route_proof_message(
-                    &confirmation.hash,
-                    &endpoint.route_id(),
-                ));
-                let proof = endpoint.identity.sign(&proof_message);
-                let hello = Record::Hello {
-                    label: self.label.clone(),
-                    proof,
+                let hello = if self.context.path == Path::DirectTcp {
+                    Record::LanHello {
+                        label: self.label.clone(),
+                    }
+                } else {
+                    let proof_message = Zeroizing::new(route_proof_message(
+                        &confirmation.hash,
+                        &endpoint.route_id(),
+                    ));
+                    Record::Hello {
+                        label: self.label.clone(),
+                        proof: endpoint.identity.sign(&proof_message),
+                    }
                 };
                 output.push(encrypt(
                     endpoint,
@@ -382,7 +479,16 @@ impl Pairing<'_> {
                 let record = Record::decode(&plaintext)?;
                 let output = match (initiator, confirmation.step, record) {
                     (_, _, Record::PairReject) => return Err(Error::Rejected),
-                    (_, Step::Hello, Record::Hello { label, proof }) => {
+                    (_, Step::Hello, Record::LanHello { label })
+                        if self.context.path == Path::DirectTcp =>
+                    {
+                        confirmation.label = Some(label);
+                        confirmation.step = Step::Compare;
+                        None
+                    }
+                    (_, Step::Hello, Record::Hello { label, proof })
+                        if self.context.path != Path::DirectTcp =>
+                    {
                         let proof_message =
                             Zeroizing::new(route_proof_message(&confirmation.hash, &from));
                         if !verify_route(&from, &proof_message, &proof) {
@@ -520,6 +626,24 @@ impl Pairing<'_> {
         }
     }
 
+    pub(super) fn approval_window(&self, now: Time) -> Result<Duration, Error> {
+        let lease = self.lease.as_ref().ok_or(Error::Closed)?;
+        let state = lease.endpoint.state()?;
+        self.check(&state, now)?;
+        let (created, wall_deadline) = match self.scanner_limit {
+            Some((wall, _)) => (self.started, wall.saturating_add(1)),
+            None => {
+                let invite = state.invite.as_ref().ok_or(Error::Closed)?;
+                (invite.created, invite.expires_at)
+            }
+        };
+        let elapsed = now
+            .monotonic
+            .checked_sub(created.monotonic)
+            .ok_or(Error::Expired)?;
+        Ok((INVITE_TTL - elapsed).min(Duration::from_secs(wall_deadline - now.unix_seconds)))
+    }
+
     fn check(&self, state: &State, now: Time) -> Result<(), Error> {
         let lease = self.lease.as_ref().ok_or(Error::Closed)?;
         state.check(lease.slot, lease.id)?;
@@ -553,7 +677,7 @@ fn comparison_code(hash: &[u8; 32]) -> VerificationCode {
 
 fn stage(
     endpoint: &Endpoint,
-    context: &Context,
+    context: &PeerContext,
     state: &mut State,
     lease: &Lease<'_>,
     confirmation: &mut Confirmation,
@@ -581,7 +705,7 @@ fn stage(
 
 fn encrypt(
     endpoint: &Endpoint,
-    context: &Context,
+    context: &PeerContext,
     initiator: bool,
     confirmation: &mut Confirmation,
     record: Record,

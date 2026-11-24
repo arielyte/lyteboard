@@ -1,19 +1,28 @@
 # Lyteboard development handoff
 
-## Scope
+Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. Windows and a Kotlin Android companion are future targets.
 
-Lyteboard will share text and images over direct Noise-encrypted TCP between paired devices on the same LAN, with offline operation, multiple peers, automatic reconnection, and local history. Keep the Rust core, Tauri + React desktop GUI, and Linux CLI and persistent daemon. Windows and a Kotlin Android companion remain future targets. QR invitations will advertise a reachable listener. mDNS and manual IP fallback come later.
+## LAN-1 checkpoint
 
-## LAN-0 baseline
+- Phase 1 and 1.5 desktop and CLI behavior, daemon lifecycle, authenticated Unix IPC, and the 4 KiB control frame contract are intact. The Phase 2B in-process and cryptographic regression fixtures are preserved.
+- `lyteboard_core::peer::lan` opens direct Tokio TCP connections with bounded length-prefixed frames. Listeners default to loopback and accept an explicit local address. A LAN QR contains a dial address and port, inviter Noise pin, expiring single-use invitation ID, and PSK. Both endpoints must compare the Noise transcript code and explicitly approve.
+- Each data connection uses a fresh KK handshake and encrypted readiness. Both sides can send UTF-8 text up to 16 KiB and acknowledge it by transfer ID. Pins and revocations live in memory. Authentication, framing, and I/O errors drop the affected connection and Noise state. [LAN wire protocol](protocol.md), [Security](security.md)
 
-- Phase 1 and 1.5 desktop and CLI entry points, daemon lifecycle, same-UID Unix IPC, and 4 KiB control frames are intact.
-- Phase 2B preserves checked X25519, XKpsk0 QR pairing, both devices' confirmation, in-memory trust and revocation, fresh pinned KK sessions, and encrypted record handling. Its identity format, Ed25519 peer binding, and in-memory wire fixtures remain in place. The existing WSS origin and routed envelope belong to those fixtures and the in-process state machine. Replace them when defining the LAN wire format without rotating Noise keys.
-- The relay service and health endpoint, WebSocket/TLS transport, registration messages, and relay dependencies are gone. Unfinished Phase 2C CLI and IPC commands were removed, restoring the Phase 1.5 control interface.
-- The unwired Linux draft in `crates/core/src/peer/storage.rs` retains private profile locking, atomic file writes, and Secret Service identity handling. The relay configuration and per-origin trust draft were removed. Durable trust and revocation are pending.
-- Direct TCP, discovery, clipboard integration, and history are planned. See [architecture](architecture.md), [LAN wire proposal](protocol.md), and [security](security.md).
+## Demonstration
 
-The Linux checkpoint passed formatting, 46 locked workspace tests, locked workspace Clippy for all targets with warnings denied, and `git diff --check`. Workspace tests ran with Unix-domain socket access for the existing IPC tests.
+From the repository root, run the two-endpoint loopback harness or all focused LAN tests:
 
-## Next implementation task
+```sh
+cargo test --locked -p lyteboard-core --test lan_tcp two_endpoints_pair_and_exchange_text -- --exact --nocapture
+cargo test --locked -p lyteboard-core --test lan_tcp
+```
 
-LAN-1 is a two-endpoint Rust TCP slice with in-memory trust, bounded frames, and an explicit LAN listener. Pair using a reachable QR address, establish a fresh KK session, and exchange acknowledged short text in both directions. Exercise wrong pins, expired and reused invitations, and malformed frames. Follow with durable trust, daemon integration, and reconnect to the saved address.
+The harness uses independently generated identities and two real TCP connections for pairing and text. The focused tests require loopback socket access. The workspace regressions also require Unix-domain socket access on Linux.
+
+## Verification
+
+All nine focused LAN tests passed. They cover pairing and bidirectional text, invalid and reused credentials, mismatched approval codes, substituted peers, tampering and plaintext injection, revocation, frame and text limits, timeouts, and disconnects. The final `cargo test --locked --workspace` passed all 55 tests on Linux. Workspace formatting, Clippy for the core and protocol with warnings denied, and `git diff --check` passed.
+
+## Remaining work
+
+The harness runs on one host. Explicit interface binding relies on host routing and firewall policy for LAN reachability. The caller drives accept, message handling, acknowledgment, and reconnect. Revocation blocks subsequent use of a live channel, and an idle receive call times out after five seconds. LAN-2 covers durable identity and trust, daemon integration, and automatic reconnect. Discovery, manual IP fallback, clipboard integration, image transfers, and history remain planned.

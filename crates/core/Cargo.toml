@@ -18,8 +18,8 @@ snow = { version = "=0.10.0", default-features = false, features = ["use-chacha2
 thiserror.workspace = true
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 zeroize = "1.8"
+tokio = { workspace = true, features = ["io-util", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true, features = ["fs"] }
+rustix = { workspace = true, features = ["fs", "time"] }
 serde.workspace = true
-tokio = { workspace = true, features = ["io-util", "time"] }

@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use cbor::Reader;
 pub use frame::{FrameKind, RoutedFrame};
-pub use invite::{Invite, QrCode};
+pub use invite::{Invite, LanInvite, QrCode};
 
 pub type RouteId = [u8; 32];
 pub type NoiseKey = [u8; 32];
@@ -101,6 +101,7 @@ impl Origin {
 pub enum Path {
     Relay,
     Lan,
+    DirectTcp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +116,10 @@ pub struct Context {
 
 impl Context {
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
-        if self.initiator == self.responder || (self.invite.is_some() && self.path != Path::Relay) {
+        if self.initiator == self.responder
+            || self.path == Path::DirectTcp
+            || (self.invite.is_some() && self.path != Path::Relay)
+        {
             return Err(WireError::Malformed);
         }
         let mut encoder = Encoder::new(Vec::new());
@@ -142,6 +146,36 @@ impl Context {
 
         Ok(encoder.into_writer())
     }
+}
+
+/// Bind the ordered peer pins and connection mode to a distinct Noise domain.
+pub fn lan_prologue(
+    channel: &ChannelId,
+    initiator: &NoiseKey,
+    responder: &NoiseKey,
+    invite: Option<&InviteId>,
+) -> Result<Vec<u8>, WireError> {
+    if initiator == responder {
+        return Err(WireError::Malformed);
+    }
+    let mut encoder = Encoder::new(Vec::new());
+    encoder
+        .array(7)
+        .unwrap()
+        .str("lyteboard.lan.tcp")
+        .unwrap()
+        .u8(VERSION)
+        .unwrap()
+        .u8(u8::from(invite.is_none()))
+        .unwrap()
+        .bytes(channel)
+        .unwrap()
+        .bytes(initiator)
+        .unwrap()
+        .bytes(responder)
+        .unwrap();
+    encode_optional(&mut encoder, invite);
+    Ok(encoder.into_writer())
 }
 
 pub fn route_proof_message(hash: &[u8; 32], route: &RouteId) -> Vec<u8> {
@@ -176,6 +210,9 @@ pub enum Record {
     Hello {
         label: String,
         proof: [u8; 64],
+    },
+    LanHello {
+        label: String,
     },
     PairApprove,
     PairCommit,
@@ -232,6 +269,10 @@ impl Record {
                 validate_label(label)?;
                 4
             }
+            Self::LanHello { label } => {
+                validate_label(label)?;
+                3
+            }
             Self::Text { text, .. } => {
                 validate_text(text)?;
                 4
@@ -249,6 +290,9 @@ impl Record {
         match self {
             Self::Hello { label, proof } => {
                 encoder.str(label).unwrap().bytes(proof).unwrap();
+            }
+            Self::LanHello { label } => {
+                encoder.str(label).unwrap();
             }
             Self::Text { id, text } => {
                 encoder.bytes(id).unwrap().str(text).unwrap();
@@ -268,7 +312,7 @@ impl Record {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         let mut reader = Reader::new(bytes, MAX_CIPHERTEXT_BYTES - NOISE_TAG_BYTES)?;
         let len = reader.array()?;
-        if !matches!(len, 2 | 4) {
+        if !matches!(len, 2..=4) {
             return Err(WireError::Malformed);
         }
         reader.version()?;
@@ -282,6 +326,13 @@ impl Record {
                     label: label.to_owned(),
                     proof,
                 });
+            }
+            (3, 0) => {
+                let label = reader.text(MAX_LABEL_BYTES)?;
+                validate_label(label)?;
+                Self::LanHello {
+                    label: label.to_owned(),
+                }
             }
             (2, 1) => Self::PairApprove,
             (2, 2) => Self::PairCommit,
@@ -320,7 +371,7 @@ impl Record {
 
     fn tag(&self) -> u8 {
         match self {
-            Self::Hello { .. } => 0,
+            Self::Hello { .. } | Self::LanHello { .. } => 0,
             Self::PairApprove => 1,
             Self::PairCommit => 2,
             Self::PairStored => 3,
