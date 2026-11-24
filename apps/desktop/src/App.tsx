@@ -1,22 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
-  discoveryLabels,
   errorMessage,
   type DaemonStatus,
   type Device,
   type DevicesView,
 } from "./api";
 import { DiscoverDevices, ManageDevice } from "./DeviceDialogs";
+import { History } from "./History";
+import { Settings } from "./Settings";
 import { PairDialog, type PairMode } from "./PairDialog";
 
 type Page = "Devices" | "History" | "Settings";
-type Theme = "system" | "light" | "dark";
+export type Theme = "system" | "light" | "dark";
 type Modal =
   | { kind: "pair"; mode: PairMode }
   | { kind: "discover" }
   | { kind: "manage"; device: Device };
-type Connection =
+export type Connection =
   | { state: "checking" | "offline" }
   | { state: "error"; error: string }
   | {
@@ -374,18 +375,21 @@ export function App() {
           </>
         )}
 
-        {page === "History" && (
-          <section className="empty">
-            <h2>Clipboard history</h2>
-            <p>
-              Use <code>lyteboard history list</code> to view saved entries from
-              the CLI.
-            </p>
-          </section>
+        {page === "History" && connection.state === "connected" && (
+          <History
+            key={connection.daemon.pid}
+            devices={deviceList}
+            openSettings={() => setPage("Settings")}
+          />
         )}
 
         {page === "Settings" && (
           <Settings
+            key={
+              connection.state === "connected"
+                ? connection.daemon.pid
+                : connection.state
+            }
             theme={theme}
             setTheme={setTheme}
             connection={connection}
@@ -416,128 +420,6 @@ export function App() {
           paired={paired}
           close={() => setModal(null)}
         />
-      )}
-    </div>
-  );
-}
-
-function Settings({
-  theme,
-  setTheme,
-  connection,
-  changed,
-}: {
-  theme: Theme;
-  setTheme: (theme: Theme) => void;
-  connection: Connection;
-  changed: (message: string) => void;
-}) {
-  const listener =
-    connection.state === "connected" ? connection.network?.listener : undefined;
-  const [editing, setEditing] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-
-  async function save(action: () => Promise<unknown>, message: string) {
-    setBusy(true);
-    setError("");
-    try {
-      await action();
-      setEditing(null);
-      changed(message);
-    } catch (failure) {
-      setError(errorMessage(failure));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="settings">
-      <section className="setting-group">
-        <h2>Appearance</h2>
-        <label className="setting-line">
-          Theme
-          <select
-            value={theme}
-            onChange={(event) => setTheme(event.target.value as Theme)}
-          >
-            <option value="system">System</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-          </select>
-        </label>
-      </section>
-      {connection.state === "connected" && (
-        <section className="setting-group">
-          <h2>Daemon</h2>
-          <div className="setting-line">
-            <span className="muted">Version</span>
-            <span>{connection.daemon.version}</span>
-          </div>
-          <div className="setting-line">
-            <span className="muted">Process ID</span>
-            <span>{connection.daemon.pid}</span>
-          </div>
-        </section>
-      )}
-      {listener && (
-        <section className="setting-group">
-          <h2>Local network</h2>
-          {error && (
-            <p className="message danger" role="alert">
-              {error}
-            </p>
-          )}
-          <form
-            className="field-row"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void save(
-                () => api.setListener(editing ?? listener.address),
-                "LAN listener updated.",
-              );
-            }}
-          >
-            <label>
-              Listener IP and port
-              <input
-                value={editing ?? listener.address}
-                spellCheck={false}
-                onChange={(event) => setEditing(event.target.value)}
-              />
-            </label>
-            <button disabled={busy || !editing?.trim()}>Apply listener</button>
-          </form>
-          <p className="muted">
-            For another computer, enter this device’s LAN IP and an available
-            port. Changes apply to this daemon session.
-          </p>
-          <div className="setting-line">
-            <div>
-              Discovery{" "}
-              <p className="muted">{discoveryLabels[listener.discovery]}</p>
-            </div>
-            <button
-              disabled={busy}
-              type="button"
-              onClick={() => {
-                const enabled =
-                  listener.discovery !== "running" &&
-                  listener.discovery !== "loopback";
-                void save(
-                  () => api.setDiscovery(enabled),
-                  enabled ? "Discovery enabled." : "Discovery disabled.",
-                );
-              }}
-            >
-              {listener.discovery === "running" ||
-              listener.discovery === "loopback"
-                ? "Turn off discovery"
-                : "Turn on discovery"}
-            </button>
-          </div>
-        </section>
       )}
     </div>
   );

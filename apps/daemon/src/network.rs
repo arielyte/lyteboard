@@ -21,8 +21,8 @@ use lyteboard_core::{
 };
 use lyteboard_protocol::{
     ipc::network::{
-        ClipboardSyncCommand, Command, DEVICES_PER_PAGE, Device, Discovered, DiscoveryState,
-        PairStatus, QueueOutcome, Reply,
+        ClipboardPreferences, ClipboardSyncCommand, Command, DEVICES_PER_PAGE, Device, Discovered,
+        DiscoveryState, PairStatus, QueueOutcome, Reply,
     },
     peer::{MAX_LABEL_BYTES, NoiseKey, validate_label},
 };
@@ -34,7 +34,7 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-use crate::history::History;
+use crate::{history::History, preferences::Preferences};
 
 use bulk::{Batch, Inbox};
 use clipboard::{AutoClipboard, ClipboardWrites};
@@ -62,6 +62,7 @@ impl Network {
     pub fn start(
         profile: Option<PathBuf>,
         history: History,
+        preferences: Preferences,
     ) -> io::Result<(Self, oneshot::Receiver<()>)> {
         let (tx, rx) = mpsc::channel(32);
         let (finished, done) = oneshot::channel();
@@ -73,7 +74,10 @@ impl Network {
         std::thread::Builder::new()
             .name("lyteboard-lan".into())
             .spawn(move || {
-                LocalSet::new().block_on(&runtime, Worker::new(profile, history, writes).run(rx));
+                LocalSet::new().block_on(
+                    &runtime,
+                    Worker::new(profile, history, writes, preferences).run(rx),
+                );
                 let _ = finished.send(());
             })?;
         Ok((
@@ -137,6 +141,9 @@ struct Worker {
     activity: Rc<RefCell<Activity>>,
     discovery: Option<Discovery>,
     discovery_enabled: bool,
+    preferences: Preferences,
+    send_error: Option<String>,
+    apply_error: Option<String>,
 }
 
 struct Activity {
@@ -178,7 +185,12 @@ pub(super) fn profile_path() -> Option<PathBuf> {
 }
 
 impl Worker {
-    fn new(profile: Option<PathBuf>, history: History, clipboard_writes: ClipboardWrites) -> Self {
+    fn new(
+        profile: Option<PathBuf>,
+        history: History,
+        clipboard_writes: ClipboardWrites,
+        preferences: Preferences,
+    ) -> Self {
         let name = env::var("LYTEBOARD_DEVICE_NAME").unwrap_or_else(|_| "Lyteboard".into());
         let label = if name.trim().is_empty() || validate_label(&name).is_err() {
             Err(format!(
@@ -193,7 +205,14 @@ impl Worker {
             endpoint: None,
             listener: None,
             discovery: None,
-            discovery_enabled: env::var("LYTEBOARD_DISCOVERY").as_deref() != Ok("off"),
+            discovery_enabled: preferences
+                .values()
+                .ok()
+                .and_then(|values| values.discovery)
+                .unwrap_or_else(|| env::var("LYTEBOARD_DISCOVERY").as_deref() != Ok("off")),
+            preferences,
+            send_error: None,
+            apply_error: None,
             activity: Rc::new(RefCell::new(Activity {
                 pair: None,
                 pair_view: PairStatus::Idle,
@@ -221,6 +240,18 @@ impl Worker {
             .is_some_and(|path| path.join("identity.json").is_file())
         {
             let _ = self.ensure_ready().await;
+        }
+        if let Ok(values) = self.preferences.values() {
+            if values.apply {
+                self.apply_error = self.start_clipboard_apply(false).await.err();
+            }
+            if !values.recipients.is_empty() {
+                if let Err(error) = self.load_recipients().await {
+                    self.send_error = Some(error);
+                } else if values.send {
+                    self.send_error = self.start_clipboard_send(false).await.err();
+                }
+            }
         }
         let mut scheduler = interval(Duration::from_millis(250));
         scheduler.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -304,7 +335,13 @@ impl Worker {
                         .and_then(|value| value.parse().ok())
                         .ok_or("Set LYTEBOARD_LISTEN_ADDR to an IP and port.")
                 })
-                .transpose()?;
+                .transpose()?
+                .or_else(|| {
+                    self.preferences
+                        .values()
+                        .ok()
+                        .and_then(|values| values.listen)
+                });
             self.bind(address, &endpoint).await?;
         }
         Ok(endpoint)
@@ -374,33 +411,112 @@ impl Worker {
         Ok(Reply::BulkQueued(outcomes))
     }
 
+    async fn load_recipients(&mut self) -> Result<(), String> {
+        let pins = self.preferences.values()?.recipients;
+        let endpoint = self.ensure_ready().await?;
+        let mut state = self.activity.borrow_mut();
+        for device in endpoint.trusted_devices().map_err(peer_error)? {
+            if pins.contains(&device.noise_key) {
+                state.sync.set_recipient(device.noise_key)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_clipboard_send(&mut self, persist: bool) -> Result<(), String> {
+        if !self.activity.borrow().sync.has_recipients() {
+            self.load_recipients().await?;
+        }
+        if !self.activity.borrow().sync.has_recipients() {
+            return Err("Select a paired device before enabling automatic sending.".into());
+        }
+        if !self.activity.borrow().sync.is_enabled() {
+            let clipboard = Clipboard::for_session().map_err(|error| error.to_string())?;
+            let monitor = Monitor::start(clipboard)
+                .await
+                .map_err(|error| error.to_string())?;
+            if persist {
+                self.preferences.update(|values| values.send = true)?;
+            }
+            self.activity
+                .borrow_mut()
+                .sync
+                .enable(&self.activity, monitor);
+        }
+        self.send_error = None;
+        Ok(())
+    }
+
+    async fn start_clipboard_apply(&mut self, persist: bool) -> Result<(), String> {
+        if !self.activity.borrow().clipboard.is_enabled() {
+            let clipboard = Clipboard::for_session().map_err(|error| {
+                format!("{error} Restart lyteboardd from that graphical session to enable automatic writes.")
+            })?;
+            clipboard
+                .check_writer()
+                .await
+                .map_err(|error| error.to_string())?;
+            if persist {
+                self.preferences.update(|values| values.apply = true)?;
+            }
+            let mut activity = self.activity.borrow_mut();
+            let writes = activity.clipboard_writes.clone();
+            activity.clipboard.enable(clipboard, writes);
+        }
+        self.apply_error = None;
+        Ok(())
+    }
+
+    fn clipboard_preferences(&self) -> Result<Reply, String> {
+        let saved = self.preferences.values()?;
+        let activity = self.activity.borrow();
+        let Reply::ClipboardSync {
+            enabled: send_active,
+            last_error: send_error,
+            ..
+        } = activity.sync.status()
+        else {
+            unreachable!()
+        };
+        let Reply::ClipboardAuto {
+            enabled: apply_active,
+            last_error: apply_error,
+        } = activity.clipboard.status()
+        else {
+            unreachable!()
+        };
+        Ok(Reply::ClipboardPreferences(ClipboardPreferences {
+            send: saved.send,
+            apply: saved.apply,
+            peers: saved.recipients.iter().map(hex::encode).collect(),
+            send_active,
+            apply_active,
+            send_error: send_error.or_else(|| self.send_error.clone()),
+            apply_error: apply_error.or_else(|| self.apply_error.clone()),
+        }))
+    }
+
     async fn clipboard_sync(&mut self, command: ClipboardSyncCommand) -> Result<Reply, String> {
         match command {
             ClipboardSyncCommand::Status => (),
             ClipboardSyncCommand::Set { enabled: false } => {
-                self.activity.borrow_mut().sync.disable()
+                self.activity.borrow_mut().sync.disable();
+                self.send_error = None;
+                self.preferences.update(|values| values.send = false)?;
             }
-            ClipboardSyncCommand::Set { enabled: true } => {
-                if !self.activity.borrow().sync.is_enabled() {
-                    if !self.activity.borrow().sync.has_recipients() {
-                        return Err(
-                            "Select a paired device with clipboard sync add DEVICE first.".into(),
-                        );
-                    }
-                    let clipboard = Clipboard::for_session().map_err(|error| error.to_string())?;
-                    let monitor = Monitor::start(clipboard)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    self.activity
-                        .borrow_mut()
-                        .sync
-                        .enable(&self.activity, monitor);
-                }
-            }
+            ClipboardSyncCommand::Set { enabled: true } => self.start_clipboard_send(true).await?,
             ClipboardSyncCommand::Recipient {
                 peer,
                 enabled: false,
-            } => self.activity.borrow_mut().sync.remove(peer),
+            } => {
+                self.preferences.update(|values| {
+                    values.recipients.remove(&peer);
+                    if values.recipients.is_empty() {
+                        values.send = false;
+                    }
+                })?;
+                self.activity.borrow_mut().sync.remove(peer);
+            }
             ClipboardSyncCommand::Recipient {
                 peer,
                 enabled: true,
@@ -414,50 +530,56 @@ impl Worker {
                 {
                     return Err("Device is not trusted.".into());
                 }
+                self.preferences.update(|values| {
+                    values.recipients.insert(peer);
+                })?;
                 self.activity.borrow_mut().sync.set_recipient(peer)?;
             }
         }
-        Ok(self.activity.borrow().sync.status())
+        let mut status = self.activity.borrow().sync.status();
+        if let Reply::ClipboardSync { last_error, .. } = &mut status
+            && last_error.is_none()
+        {
+            *last_error = self.send_error.clone();
+        }
+        Ok(status)
     }
 
     async fn command(&mut self, command: Command) -> Result<Reply, String> {
         if let Command::Listen { address } = command {
             let endpoint = self.ensure_endpoint()?;
             self.bind(Some(address), &endpoint).await?;
+            self.preferences
+                .update(|values| values.listen = Some(address))?;
             return self.status();
         }
         match command {
             Command::ClipboardSync(command) => return self.clipboard_sync(command).await,
-            Command::ClipboardAutoStatus => return Ok(self.activity.borrow().clipboard.status()),
-            Command::SetClipboardAuto { enabled: false } => {
-                self.activity.borrow_mut().clipboard.disable();
-                return Ok(self.activity.borrow().clipboard.status());
-            }
-            Command::SetClipboardAuto { enabled: true } => {
-                if !self.activity.borrow().clipboard.is_enabled() {
-                    let clipboard = Clipboard::for_session().map_err(|error| {
-                        format!("{error} Restart lyteboardd from that graphical session to enable automatic writes.")
-                    })?;
-                    clipboard
-                        .check_writer()
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let mut activity = self.activity.borrow_mut();
-                    let writes = activity.clipboard_writes.clone();
-                    activity.clipboard.enable(clipboard, writes);
+            Command::ClipboardPreferences => return self.clipboard_preferences(),
+            Command::ClipboardAutoStatus => return Ok(self.clipboard_apply_status()),
+            Command::SetClipboardAuto { enabled } => {
+                if enabled {
+                    self.start_clipboard_apply(true).await?;
+                } else {
+                    self.activity.borrow_mut().clipboard.disable();
+                    self.apply_error = None;
+                    self.preferences.update(|values| values.apply = false)?;
                 }
-                return Ok(self.activity.borrow().clipboard.status());
+                return Ok(self.clipboard_apply_status());
             }
             _ => {}
         }
         let endpoint = self.ensure_ready().await?;
         match command {
             Command::Listen { .. }
+            | Command::ClipboardPreferences
             | Command::ClipboardAutoStatus
             | Command::ClipboardSync(_)
             | Command::SetClipboardAuto { .. } => unreachable!(),
             Command::Status => self.status(),
             Command::SetDiscovery { enabled } => {
+                self.preferences
+                    .update(|values| values.discovery = Some(enabled))?;
                 self.discovery_enabled = enabled;
                 self.update_discovery(&endpoint).await;
                 self.status()
@@ -572,6 +694,18 @@ impl Worker {
                 let mut state = self.activity.borrow_mut();
                 state.sessions.remove_peer(peer);
                 state.sync.remove(peer);
+                if self
+                    .preferences
+                    .values()
+                    .is_ok_and(|values| values.recipients.contains(&peer))
+                {
+                    let _ = self.preferences.update(|values| {
+                        values.recipients.remove(&peer);
+                        if values.recipients.is_empty() {
+                            values.send = false;
+                        }
+                    });
+                }
                 Ok(Reply::Ok)
             }
             Command::Send { peer, text } => {
@@ -590,6 +724,16 @@ impl Worker {
                 self.activity.borrow().inbox.message(offset),
             )),
         }
+    }
+
+    fn clipboard_apply_status(&self) -> Reply {
+        let mut status = self.activity.borrow().clipboard.status();
+        if let Reply::ClipboardAuto { last_error, .. } = &mut status
+            && last_error.is_none()
+        {
+            *last_error = self.apply_error.clone();
+        }
+        status
     }
 
     fn listener(&self) -> &Listener {

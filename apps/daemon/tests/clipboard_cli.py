@@ -352,7 +352,7 @@ def exercise(alpha, beta, gamma, source, manual, automatic, kwin, x11):
     gamma.cli("clipboard", "auto", "on")
     gamma.stop()
     gamma.start()
-    assert gamma.cli("clipboard", "auto") == "Automatic clipboard application off"
+    assert gamma.cli("clipboard", "auto") == "Automatic clipboard application on"
 
 
 def main():

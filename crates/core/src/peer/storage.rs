@@ -176,9 +176,7 @@ impl Profile {
         name: &str,
         limit: usize,
     ) -> Result<Option<T>, StorageError> {
-        self.read(name, limit)?
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| StorageError::Invalid))
-            .transpose()
+        read_private_json(&self.dir, name, limit)
     }
 
     fn write_json(
@@ -187,58 +185,83 @@ impl Profile {
         value: &impl Serialize,
         limit: usize,
     ) -> Result<(), StorageError> {
-        self.write(
-            name,
-            &serde_json::to_vec(value).map_err(|_| StorageError::Invalid)?,
-            limit,
-        )
+        write_private_json(&self.dir, name, value, limit)
     }
 
-    fn read(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>, StorageError> {
-        let fd = match openat(&self.dir, name, READ_FLAGS, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let file = File::from(fd);
-        check_private_file(&file)?;
-        let mut bytes = Vec::new();
-        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            return Err(StorageError::Invalid);
-        }
-        Ok(Some(bytes))
-    }
-
+    #[cfg(test)]
     fn write(&self, name: &str, bytes: &[u8], limit: usize) -> Result<(), StorageError> {
-        if bytes.len() > limit {
-            return Err(StorageError::Invalid);
-        }
-        let mut suffix = [0; 16];
-        getrandom::fill(&mut suffix).map_err(|_| CredentialError::EntropyUnavailable)?;
-        let temporary = format!(".{:032x}.tmp", u128::from_ne_bytes(suffix));
-        let fd = openat(
-            &self.dir,
-            temporary.as_str(),
-            LOCK_FLAGS | OFlags::EXCL,
-            PRIVATE_FILE,
-        )?;
-        let mut file = File::from(fd);
-        let result = (|| {
-            check_private_file(&file)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            renameat(&self.dir, temporary.as_str(), &self.dir, name)?;
-            self.dir
-                .sync_all()
-                .map_err(|_| StorageError::WriteUncertain)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = unlinkat(&self.dir, temporary.as_str(), AtFlags::empty());
-        }
-        result
+        write_private(&self.dir, name, bytes, limit)
     }
+}
+
+/// Read a bounded JSON file from an already checked private directory.
+pub fn read_private_json<T: serde::de::DeserializeOwned>(
+    dir: &File,
+    name: &str,
+    limit: usize,
+) -> Result<Option<T>, StorageError> {
+    read_private(dir, name, limit)?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| StorageError::Invalid))
+        .transpose()
+}
+
+/// Atomically replace a bounded JSON file inside an already checked private directory.
+pub fn write_private_json(
+    dir: &File,
+    name: &str,
+    value: &impl Serialize,
+    limit: usize,
+) -> Result<(), StorageError> {
+    write_private(
+        dir,
+        name,
+        &serde_json::to_vec(value).map_err(|_| StorageError::Invalid)?,
+        limit,
+    )
+}
+
+fn read_private(dir: &File, name: &str, limit: usize) -> Result<Option<Vec<u8>>, StorageError> {
+    let fd = match openat(dir, name, READ_FLAGS, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let file = File::from(fd);
+    check_private_file(&file)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(StorageError::Invalid);
+    }
+    Ok(Some(bytes))
+}
+
+fn write_private(dir: &File, name: &str, bytes: &[u8], limit: usize) -> Result<(), StorageError> {
+    if bytes.len() > limit {
+        return Err(StorageError::Invalid);
+    }
+    let mut suffix = [0; 16];
+    getrandom::fill(&mut suffix).map_err(|_| CredentialError::EntropyUnavailable)?;
+    let temporary = format!(".{:032x}.tmp", u128::from_ne_bytes(suffix));
+    let fd = openat(
+        dir,
+        temporary.as_str(),
+        LOCK_FLAGS | OFlags::EXCL,
+        PRIVATE_FILE,
+    )?;
+    let mut file = File::from(fd);
+    let result = (|| {
+        check_private_file(&file)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        renameat(dir, temporary.as_str(), dir, name)?;
+        dir.sync_all().map_err(|_| StorageError::WriteUncertain)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unlinkat(dir, temporary.as_str(), AtFlags::empty());
+    }
+    result
 }
 
 pub(super) struct TrustFile {

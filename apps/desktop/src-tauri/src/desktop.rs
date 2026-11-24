@@ -4,7 +4,11 @@ use std::{fmt::Write as _, net::SocketAddr};
 
 use lyteboard_core::ipc::{
     Client, ClientError, Status,
-    network::{Command, ConnectionState, DEVICES_PER_PAGE, DiscoveryState, PairStatus, Reply},
+    network::{
+        ClipboardPreferences, ClipboardSyncCommand, Command, ConnectionState, DEVICES_PER_PAGE,
+        Delivery, DiscoveryState, HistoryCommand, HistoryConfiguration, HistoryEntry,
+        HistoryLimits, MAX_HISTORY_QUERY_BYTES, MAX_RECIPIENTS, PairStatus, QueueOutcome, Reply,
+    },
 };
 use lyteboard_protocol::peer::{LanInvite, MAX_LABEL_BYTES, NoiseKey, validate_label};
 use qrcode::{Color, QrCode};
@@ -215,28 +219,16 @@ pub(crate) async fn send_clipboard(recipients: Vec<String>) -> Result<Vec<Delive
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn send_on_linux(recipients: Vec<String>) -> Result<Vec<DeliveryView>> {
-    use std::{collections::BTreeSet, time::Duration};
+static SENDING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-    use lyteboard_core::{
-        clipboard::Clipboard,
-        ipc::network::{Delivery, MAX_RECIPIENTS, QueueOutcome},
-    };
-    use tokio::{
-        sync::Semaphore,
-        time::{Instant, sleep, timeout_at},
-    };
-
-    static SENDING: Semaphore = Semaphore::const_new(1);
-    let _permit = SENDING
-        .try_acquire()
-        .map_err(|_| "Clipboard sending is already in progress.")?;
+fn recipients(ids: Vec<String>) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    let recipients = ids;
     let mut unique = BTreeSet::new();
     if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
         return Err(format!("Select one to {MAX_RECIPIENTS} paired devices."));
     }
-    let recipients = recipients
+    recipients
         .into_iter()
         .map(|id| {
             let key = pin(&id)?;
@@ -245,8 +237,16 @@ async fn send_on_linux(recipients: Vec<String>) -> Result<Vec<DeliveryView>> {
             }
             Ok(hex::encode(key))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
 
+#[cfg(target_os = "linux")]
+async fn send_on_linux(ids: Vec<String>) -> Result<Vec<DeliveryView>> {
+    use lyteboard_core::clipboard::Clipboard;
+    let _permit = SENDING
+        .try_acquire()
+        .map_err(|_| "Clipboard sending is already in progress.")?;
+    let recipients = recipients(ids)?;
     let client = client()?;
     client.ping().await.map_err(|error| error.to_string())?;
     let (media, bytes) = Clipboard::for_session()
@@ -259,6 +259,17 @@ async fn send_on_linux(recipients: Vec<String>) -> Result<Vec<DeliveryView>> {
         .await
         .map_err(|error| error.to_string())?;
     drop(bytes);
+    delivery_results(&client, recipients, outcomes).await
+}
+
+async fn delivery_results(
+    client: &Client,
+    recipients: Vec<String>,
+    outcomes: Vec<QueueOutcome>,
+) -> Result<Vec<DeliveryView>> {
+    use std::time::Duration;
+    use tokio::time::{Instant, sleep, timeout_at};
+
     if outcomes.len() != recipients.len() {
         return Err(unexpected());
     }
@@ -280,7 +291,7 @@ async fn send_on_linux(recipients: Vec<String>) -> Result<Vec<DeliveryView>> {
         let mut waiting = Vec::new();
         for (index, id) in pending {
             results[index].error =
-                match timeout_at(deadline, request(&client, Command::Delivery { id })).await {
+                match timeout_at(deadline, request(client, Command::Delivery { id })).await {
                     Ok(Ok(Reply::Delivery(Delivery::Delivered))) => None,
                     Ok(Ok(Reply::Delivery(Delivery::Pending))) => {
                         waiting.push((index, id));
@@ -393,4 +404,196 @@ pub(crate) async fn pair_confirm(code: String) -> Result<()> {
 #[tauri::command]
 pub(crate) async fn pair_cancel() -> Result<()> {
     mutate(Command::CancelPair).await
+}
+
+#[tauri::command]
+pub(crate) async fn clipboard_preferences() -> Result<ClipboardPreferences> {
+    let Reply::ClipboardPreferences(settings) =
+        request(&client()?, Command::ClipboardPreferences).await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) async fn set_clipboard_sending(enabled: bool) -> Result<ClipboardPreferences> {
+    request(
+        &client()?,
+        Command::ClipboardSync(ClipboardSyncCommand::Set { enabled }),
+    )
+    .await?;
+    clipboard_preferences().await
+}
+
+#[tauri::command]
+pub(crate) async fn set_clipboard_application(enabled: bool) -> Result<ClipboardPreferences> {
+    request(&client()?, Command::SetClipboardAuto { enabled }).await?;
+    clipboard_preferences().await
+}
+
+#[tauri::command]
+pub(crate) async fn set_clipboard_recipient(
+    id: String,
+    enabled: bool,
+) -> Result<ClipboardPreferences> {
+    request(
+        &client()?,
+        Command::ClipboardSync(ClipboardSyncCommand::Recipient {
+            peer: pin(&id)?,
+            enabled,
+        }),
+    )
+    .await?;
+    clipboard_preferences().await
+}
+
+#[tauri::command]
+pub(crate) async fn history_configuration() -> Result<HistoryConfiguration> {
+    history_config(HistoryCommand::Configuration).await
+}
+
+#[tauri::command]
+pub(crate) async fn configure_history(
+    enabled: bool,
+    limits: HistoryLimits,
+) -> Result<HistoryConfiguration> {
+    if !limits.is_valid() {
+        return Err("Enter valid history retention limits.".into());
+    }
+    history_config(HistoryCommand::Configure { enabled, limits }).await
+}
+
+async fn history_config(command: HistoryCommand) -> Result<HistoryConfiguration> {
+    let Reply::HistoryConfiguration(value) = request(&client()?, Command::History(command)).await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(value)
+}
+
+#[derive(Serialize)]
+pub(crate) struct HistoryPageView {
+    entries: Vec<HistoryEntry>,
+    more: bool,
+}
+
+#[tauri::command]
+pub(crate) async fn history_page(before: Option<i64>, query: String) -> Result<HistoryPageView> {
+    let query = query.trim();
+    if query.len() > MAX_HISTORY_QUERY_BYTES || query.contains('\0') {
+        return Err("Search must be at most 256 UTF-8 bytes.".into());
+    }
+    let command = if query.is_empty() {
+        HistoryCommand::List { before }
+    } else {
+        HistoryCommand::Search {
+            before,
+            query: query.into(),
+        }
+    };
+    let Reply::HistoryPage { entries, more } =
+        request(&client()?, Command::History(command)).await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(HistoryPageView { entries, more })
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PreviewView {
+    Text { text: String },
+    Image { data: String },
+}
+
+#[tauri::command]
+pub(crate) async fn history_preview(id: i64) -> Result<PreviewView> {
+    #[cfg(target_os = "linux")]
+    {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use lyteboard_protocol::peer::Media;
+        static PREVIEWS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _permit = PREVIEWS
+            .try_acquire()
+            .map_err(|_| "Another preview is loading.")?;
+        let (media, bytes) = client()?
+            .download_history_preview(id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("History entry was not found.")?;
+        match media {
+            Media::Text => Ok(PreviewView::Text {
+                text: std::str::from_utf8(&bytes)
+                    .map_err(|_| "History preview contains invalid text.")?
+                    .into(),
+            }),
+            Media::Png => Ok(PreviewView::Image {
+                data: STANDARD.encode(&*bytes),
+            }),
+            _ => Err(unexpected()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        Err("Clipboard history is currently supported on Linux.".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn restore_history(id: i64) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let clipboard = lyteboard_core::clipboard::Clipboard::for_session()
+            .map_err(|error| error.to_string())?;
+        let (media, bytes) = client()?
+            .download_history(id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("History entry was not found.")?;
+        return clipboard
+            .write_content(media, &bytes)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        Err("Clipboard history is currently supported on Linux.".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn resend_history(id: i64, devices: Vec<String>) -> Result<Vec<DeliveryView>> {
+    let _permit = SENDING
+        .try_acquire()
+        .map_err(|_| "Clipboard sending is already in progress.")?;
+    let devices = recipients(devices)?;
+    let client = client()?;
+    let Reply::BulkQueued(outcomes) = request(
+        &client,
+        Command::History(HistoryCommand::Resend {
+            id,
+            peers: devices.clone(),
+        }),
+    )
+    .await?
+    else {
+        return Err(unexpected());
+    };
+    delivery_results(&client, devices, outcomes).await
+}
+
+#[tauri::command]
+pub(crate) async fn delete_history(id: i64) -> Result<()> {
+    mutate(Command::History(HistoryCommand::Delete { id })).await
+}
+
+#[tauri::command]
+pub(crate) async fn clear_history(confirmed: bool) -> Result<()> {
+    if !confirmed {
+        return Err("Confirm that you want to clear all history.".into());
+    }
+    mutate(Command::History(HistoryCommand::Clear)).await
 }

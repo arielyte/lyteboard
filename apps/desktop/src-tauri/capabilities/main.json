@@ -16,6 +16,18 @@
     "allow-pair-import",
     "allow-pair-status",
     "allow-pair-confirm",
-    "allow-pair-cancel"
+    "allow-pair-cancel",
+    "allow-clipboard-preferences",
+    "allow-set-clipboard-sending",
+    "allow-set-clipboard-application",
+    "allow-set-clipboard-recipient",
+    "allow-history-configuration",
+    "allow-configure-history",
+    "allow-history-page",
+    "allow-history-preview",
+    "allow-restore-history",
+    "allow-resend-history",
+    "allow-delete-history",
+    "allow-clear-history"
   ]
 }

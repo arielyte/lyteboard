@@ -113,6 +113,23 @@ class Window:
             self.request(path + "/clear", {})
             self.request(path + "/value", {"text": value})
 
+    def check_element(self, label):
+        return wait_for(lambda: self.js("""
+            const scope = document.querySelector('dialog[open]') ?? document;
+            return [...scope.querySelectorAll('label')].find(label =>
+                label.textContent.trim() === arguments[0]
+            )?.querySelector('input[type=checkbox]') ?? null;
+        """, label))
+
+    def check(self, label, enabled):
+        element = self.check_element(label)
+        if self.js("return arguments[0].checked;", element) != enabled:
+            self.request(self.session + f"/element/{element[ELEMENT]}/click", {})
+        wait_for(lambda: self.js("return arguments[0].checked === arguments[1];", element, enabled))
+
+    def checked(self, label):
+        return self.js("return arguments[0].checked;", self.check_element(label))
+
     def visible(self, text):
         return self.js("return document.body.innerText.includes(arguments[0]);", text)
 
@@ -181,6 +198,124 @@ def discover(window, alpha, beta, host):
         window.wait_text("No devices discovered.")
         window.wait_text("Set a LAN listener in Settings")
     window.click("Close Discover devices")
+
+
+def history_and_preferences(window, alpha, beta, clip, args):
+    window.page("History")
+    window.wait_text("Clipboard history is off")
+    window.click("Open Settings")
+    window.wait_text("Local clipboard history is stored without encryption at rest.")
+    assert not window.checked("Automatic sending")
+    assert not window.checked("Automatically apply received content")
+    window.check("Persistent clipboard history", True)
+    window.wait_text("History enabled.")
+    for label, value in (("Maximum entries", "25"), ("Maximum MiB", "12"), ("Maximum days", "3")):
+        window.field(label, value)
+    window.click("Save retention")
+    window.wait_text("Retention saved.")
+    assert alpha.cli("history", "status") == "History on (25 entries, 12 MiB, 3 days)"
+    window.page("History")
+    window.wait_text("No history entries")
+
+    sender = beta.devices()["Alpha"][0]
+    wait_for(lambda: beta.online(sender))
+    for index in range(17):
+        assert beta.cli("send", sender, f"Archive entry {index:02d}") == "Delivered"
+    window.page("Devices")
+    image = png(320, 160)
+    clip.seed(image, "image/png")
+    window.click("Send clipboard to Beta laptop")
+    window.wait_text("Clipboard delivered to 1 of 1 device.")
+
+    window.page("History")
+    wait_for(lambda: window.js("""
+        const img = document.querySelector('.history-entry img');
+        return img && img.naturalWidth === 128 && img.naturalHeight === 64;
+    """))
+    window.wait_text("Sent to Beta laptop")
+    clip.seed(b"Replace the live clipboard before restoring the image")
+    window.click("Restore")
+    window.wait_text("Restored to clipboard.")
+    assert clip.read("image/png") == image
+    window.click("Next")
+    window.wait_text("Page 2")
+    assert wait_for(lambda: window.js("return document.querySelectorAll('.history-entry').length === 2;"))
+    window.click("Previous")
+    window.field("Search history text", "archive entry 05")
+    window.click("Search")
+    window.wait_text("Archive entry 05")
+    assert window.js("return document.querySelectorAll('.history-entry').length;") == 1
+    window.wait_text("Received from Beta laptop")
+    window.click("Restore")
+    window.wait_text("Restored to clipboard.")
+    assert clip.read() == b"Archive entry 05"
+    window.click("Resend")
+    window.check("Beta laptop", True)
+    window.click("Resend to selected")
+    window.wait_text("Clipboard delivered to 1 of 1 device.")
+    assert "Archive entry 05" in beta.cli("received")
+    assert len(alpha.cli("history", "list", "--search", "archive entry 05").splitlines()) == 3
+
+    window.field("Search history text", "archive entry 04")
+    window.click("Search")
+    window.wait_text("Archive entry 04")
+    window.click("Delete")
+    window.wait_text("History entry deleted.")
+    window.wait_text("No matching entries")
+    window.click("Clear history")
+    window.click("Keep history")
+    assert "Archive" not in alpha.cli("history", "list")
+
+    window.page("Settings")
+    window.check("Persistent clipboard history", False)
+    window.wait_text("History disabled.")
+    window.page("History")
+    window.wait_text("Clipboard history is off")
+    window.page("Settings")
+    window.check("Persistent clipboard history", True)
+    window.wait_text("History enabled.")
+    window.page("History")
+    window.wait_text("Sent to Beta laptop")
+
+    window.page("Settings")
+    window.check("Beta laptop", True)
+    window.check("Automatic sending", True)
+    window.check("Automatically apply received content", True)
+    window.click("Turn off discovery")
+    window.wait_text("Discovery disabled.")
+    listener = f"{args.lan_ip}:{free_port()}"
+    window.field("Listener IP and port", listener)
+    window.click("Apply listener")
+    window.wait_text("LAN listener updated.")
+    alpha.env.pop("LYTEBOARD_LISTEN_ADDR", None)
+
+    alpha.stop()
+    window.refresh()
+    window.wait_text("Daemon offline")
+    alpha.start()
+    window.refresh()
+    window.wait_text("Daemon running")
+    assert alpha.listener("status") == listener
+    assert alpha.cli("network", "status").endswith("discovery off")
+    assert alpha.cli("history", "status") == "History on (25 entries, 12 MiB, 3 days)"
+    assert alpha.cli("clipboard", "sync", "status").startswith("Automatic clipboard sending on")
+    assert alpha.cli("clipboard", "auto") == "Automatic clipboard application on"
+    for label in ("Beta laptop", "Automatic sending", "Automatically apply received content", "Persistent clipboard history"):
+        assert window.checked(label)
+    window.page("History")
+    window.wait_text("Sent to Beta laptop")
+    window.click("Clear history")
+    window.click("Confirm clear")
+    window.wait_text("No history entries")
+
+    alpha.stop()
+    file = Path(alpha.env["LYTEBOARD_PROFILE"]) / "history" / "history.sqlite3"
+    file.write_bytes(b"corrupt disposable history")
+    alpha.start()
+    window.refresh()
+    window.wait_text("History unavailable")
+    window.wait_text("History storage is unavailable")
+    assert alpha.cli("ping") == "Pong"
 
 
 def exercise(root, cleanup, args):
@@ -296,8 +431,7 @@ def exercise(root, cleanup, args):
     window.click("Confirm removal")
     window.wait_text("Device removed.")
     assert "Gamma" not in alpha.devices()
-    window.click("History")
-    window.wait_text("lyteboard history list")
+    history_and_preferences(window, alpha, beta, clip, args)
     window.close()
     assert alpha.cli("ping") == "Pong"
 

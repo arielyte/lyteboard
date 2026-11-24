@@ -4,17 +4,23 @@ use std::{
     env,
     fs::File,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use lyteboard_core::{
-    bulk::Payload,
+    bulk::{Payload, thumbnail},
     peer::storage::{check_private_file, lock_named, open_private_dir},
 };
 use lyteboard_protocol::{
-    ipc::network::{HISTORY_PER_PAGE, HistoryDirection, HistoryEntry, HistoryLimits, Reply},
+    ipc::network::{
+        HISTORY_PER_PAGE, HistoryConfiguration, HistoryDirection, HistoryEntry, HistoryLimits,
+        MAX_HISTORY_QUERY_BYTES, Reply,
+    },
     peer::{MAX_BULK_TEXT_BYTES, MAX_IMAGE_BYTES, Media, NoiseKey},
 };
 use rusqlite::{Connection, Error, OpenFlags, OptionalExtension, Transaction, params};
@@ -29,26 +35,33 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+use crate::preferences::{HistorySettings, Preferences};
+
 const DB: &str = "history.sqlite3";
 const APPLICATION_ID: i64 = 0x4c594843;
 const MIB: i64 = 1024 * 1024;
-const DISABLED: &str = "History is disabled. Start the daemon with LYTEBOARD_HISTORY=on.";
+const DISABLED: &str =
+    "History is disabled. Enable it in Settings or run lyteboard history enable.";
 const UNAVAILABLE: &str = "History storage is unavailable. Check the private profile, permissions, free space, and database integrity, then restart the daemon.";
 
 type Bytes = Zeroizing<Vec<u8>>;
 type Result<T> = std::result::Result<T, String>;
 
+type Job = (Operation, oneshot::Sender<Result<Output>>);
+
 #[derive(Clone)]
-pub(super) enum History {
-    Disabled,
-    Unavailable(String),
-    Running(mpsc::Sender<(Operation, oneshot::Sender<Result<Output>>)>),
+pub(super) struct History {
+    worker: mpsc::Sender<Job>,
+    recording: Arc<AtomicBool>,
 }
 
 pub(super) enum Operation {
     Status,
-    List(Option<i64>),
+    Configuration,
+    Configure(HistorySettings),
+    List(Option<i64>, Option<String>),
     Load(i64),
+    Preview(i64),
     Delete(i64),
     Clear,
     Record(HistoryDirection, NoiseKey, i64, Arc<Payload>),
@@ -60,42 +73,32 @@ pub(super) enum Output {
 }
 
 impl History {
-    pub(super) fn start(profile: Option<PathBuf>) -> Self {
-        let limits = match configuration() {
-            Ok(None) => return Self::Disabled,
-            Ok(Some(limits)) => limits,
-            Err(error) => return Self::Unavailable(error),
-        };
-        let Some(profile) = profile else {
-            return Self::Unavailable(
-                "Set LYTEBOARD_PROFILE to an absolute private data directory.".into(),
-            );
-        };
-        let (tx, rx) = mpsc::channel(4);
-        let worker = thread::Builder::new()
+    pub(super) fn start(
+        profile: Option<PathBuf>,
+        preferences: Preferences,
+    ) -> std::io::Result<Self> {
+        let (worker, rx) = mpsc::channel(4);
+        let settings = preferences
+            .values()
+            .and_then(|values| values.history.map_or_else(environment, Ok));
+        let recording = Arc::new(AtomicBool::new(
+            settings.as_ref().is_ok_and(|settings| settings.enabled),
+        ));
+        let active = Arc::clone(&recording);
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        thread::Builder::new()
             .name("lyteboard-history".into())
             .spawn(move || {
-                if let Ok(runtime) = runtime::Builder::new_current_thread().enable_time().build() {
-                    runtime.block_on(run(&profile, limits, rx));
-                }
-            });
-        if worker.is_err() {
-            return Self::Unavailable("Could not start the clipboard history worker.".into());
-        }
-        Self::Running(tx)
+                runtime.block_on(run(profile, preferences, settings, active, rx));
+            })?;
+        Ok(Self { worker, recording })
     }
 
     async fn dispatch(&self, operation: Operation) -> Result<Output> {
-        let worker = match self {
-            Self::Disabled if matches!(operation, Operation::Status) => {
-                return Ok(Output::Control(Reply::HistoryStatus(None)));
-            }
-            Self::Disabled => return Err(DISABLED.into()),
-            Self::Unavailable(error) => return Err(error.clone()),
-            Self::Running(worker) => worker,
-        };
         let (tx, rx) = oneshot::channel();
-        worker
+        self.worker
             .send((operation, tx))
             .await
             .map_err(|_| UNAVAILABLE)?;
@@ -125,13 +128,27 @@ impl History {
             .map_err(|_| "History entry contains invalid clipboard data.".into())
     }
 
+    pub(super) async fn preview(&self, id: i64) -> Result<(Media, Bytes)> {
+        let Output::Payload(media, bytes) = self.dispatch(Operation::Preview(id)).await? else {
+            unreachable!()
+        };
+        if media == Media::Text {
+            Ok((media, bytes))
+        } else {
+            thumbnail(media, bytes)
+                .await
+                .map(|png| (Media::Png, png))
+                .map_err(|_| "History image cannot be previewed.".into())
+        }
+    }
+
     pub(super) async fn record(
         &self,
         direction: HistoryDirection,
         peer: NoiseKey,
         payload: &Arc<Payload>,
     ) {
-        if matches!(self, Self::Running(_)) {
+        if self.recording.load(Ordering::Relaxed) {
             // Bound how long a peer session waits on a slow filesystem.
             let _ = timeout(
                 Duration::from_secs(3),
@@ -147,13 +164,13 @@ impl History {
     }
 }
 
-fn configuration() -> Result<Option<HistoryLimits>> {
-    match env::var("LYTEBOARD_HISTORY") {
-        Ok(value) if value == "on" => (),
-        Ok(value) if value == "off" => return Ok(None),
-        Err(env::VarError::NotPresent) => return Ok(None),
+fn environment() -> Result<HistorySettings> {
+    let enabled = match env::var("LYTEBOARD_HISTORY") {
+        Ok(value) if value == "on" => true,
+        Ok(value) if value == "off" => false,
+        Err(env::VarError::NotPresent) => false,
         _ => return Err("Set LYTEBOARD_HISTORY to on or off.".into()),
-    }
+    };
     fn limit(name: &str, default: u32, max: u32) -> Result<u32> {
         match env::var(name) {
             Err(env::VarError::NotPresent) => Ok(default),
@@ -164,11 +181,18 @@ fn configuration() -> Result<Option<HistoryLimits>> {
                 .ok_or_else(|| format!("Set {name} to an integer between 1 and {max}.")),
         }
     }
-    Ok(Some(HistoryLimits {
-        entries: limit("LYTEBOARD_HISTORY_ENTRIES", 100, 10_000)?,
-        mib: limit("LYTEBOARD_HISTORY_MIB", 100, 1024)?,
-        days: limit("LYTEBOARD_HISTORY_DAYS", 7, 3650)?,
-    }))
+    Ok(HistorySettings {
+        enabled,
+        limits: if !enabled {
+            HistoryLimits::default()
+        } else {
+            HistoryLimits {
+                entries: limit("LYTEBOARD_HISTORY_ENTRIES", 100, 10_000)?,
+                mib: limit("LYTEBOARD_HISTORY_MIB", 100, 1024)?,
+                days: limit("LYTEBOARD_HISTORY_DAYS", 7, 3650)?,
+            }
+        },
+    })
 }
 
 fn now() -> i64 {
@@ -178,13 +202,114 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+struct ActiveHistory {
+    settings: Result<HistorySettings>,
+    store: Option<Store>,
+    error: Option<String>,
+    profile: Option<PathBuf>,
+}
+
+impl ActiveHistory {
+    fn apply(&mut self, settings: HistorySettings) {
+        self.settings = Ok(settings);
+        self.error = None;
+        if !settings.enabled {
+            self.store = None;
+        } else {
+            let result = match self.store.as_mut() {
+                Some(store) => store
+                    .set_limits(settings.limits)
+                    .map_err(|_| UNAVAILABLE.into()),
+                None => self
+                    .profile
+                    .as_deref()
+                    .ok_or_else(|| UNAVAILABLE.into())
+                    .and_then(|path| Store::open(path, settings.limits))
+                    .map(|store| self.store = Some(store)),
+            };
+            if let Err(error) = result {
+                self.store = None;
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn request(&mut self, operation: Operation, preferences: &Preferences) -> Result<Output> {
+        match operation {
+            Operation::Configure(settings) => {
+                if !settings.limits.is_valid() {
+                    return Err("Invalid history retention limits.".into());
+                }
+                if let Err(error) = preferences.update(|values| values.history = Some(settings)) {
+                    if !settings.enabled {
+                        self.apply(settings);
+                    }
+                    return Err(error);
+                }
+                self.apply(settings);
+                self.configuration()
+            }
+            Operation::Configuration => self.configuration(),
+            Operation::Status => {
+                let settings = self.settings.as_ref().map_err(Clone::clone)?;
+                if let Some(error) = &self.error {
+                    return Err(error.clone());
+                }
+                Ok(Output::Control(Reply::HistoryStatus(
+                    settings.enabled.then_some(settings.limits),
+                )))
+            }
+            operation => {
+                let settings = self.settings.as_ref().map_err(Clone::clone)?;
+                if !settings.enabled {
+                    return Err(DISABLED.into());
+                }
+                let store = self.store.as_mut().ok_or(UNAVAILABLE)?;
+                let mut failed = false;
+                let recover = matches!(
+                    operation,
+                    Operation::Record(..) | Operation::Delete(..) | Operation::Clear
+                );
+                let result = store.request(operation, &mut failed);
+                if failed {
+                    self.error = Some(UNAVAILABLE.into());
+                } else if recover && result.is_ok() {
+                    self.error = None;
+                }
+                result
+            }
+        }
+    }
+
+    fn configuration(&self) -> Result<Output> {
+        let settings = self.settings.as_ref().map_err(Clone::clone)?;
+        Ok(Output::Control(Reply::HistoryConfiguration(
+            HistoryConfiguration {
+                enabled: settings.enabled,
+                limits: settings.limits,
+                error: self.error.clone(),
+            },
+        )))
+    }
+}
+
 async fn run(
-    profile: &Path,
-    limits: HistoryLimits,
-    mut rx: mpsc::Receiver<(Operation, oneshot::Sender<Result<Output>>)>,
+    profile: Option<PathBuf>,
+    preferences: Preferences,
+    settings: Result<HistorySettings>,
+    recording: Arc<AtomicBool>,
+    mut rx: mpsc::Receiver<Job>,
 ) {
-    let mut store = Store::open(profile, limits);
-    let mut failed = false;
+    let mut active = ActiveHistory {
+        settings,
+        store: None,
+        error: None,
+        profile,
+    };
+    if let Ok(settings) = active.settings {
+        active.apply(settings);
+    }
+    recording.store(active.store.is_some(), Ordering::Relaxed);
     let mut cleanup = interval(Duration::from_secs(60));
     loop {
         tokio::select! {
@@ -193,16 +318,13 @@ async fn run(
                 if reply.is_closed() && !matches!(operation, Operation::Record(..)) {
                     continue;
                 }
-                let result = match &mut store {
-                    Err(error) => Err(error.clone()),
-                    Ok(_) if failed && matches!(operation, Operation::Status) => Err(UNAVAILABLE.into()),
-                    Ok(store) => store.request(operation, &mut failed),
-                };
+                let result = active.request(operation, &preferences);
+                recording.store(active.store.is_some(), Ordering::Relaxed);
                 let _ = reply.send(result);
             }
-            _ = cleanup.tick() => {
-                if let Ok(store) = &mut store && store.expire(now()).is_err() {
-                    failed = true;
+            _ = cleanup.tick(), if active.store.is_some() => {
+                if let Some(store) = &mut active.store && store.expire(now()).is_err() {
+                    active.error = Some(UNAVAILABLE.into());
                 }
             }
         }
@@ -379,16 +501,33 @@ impl Store {
         if retained { tx.commit() } else { tx.rollback() }
     }
 
-    fn list(&self, before: Option<i64>) -> rusqlite::Result<Vec<HistoryEntry>> {
+    fn set_limits(&mut self, limits: HistoryLimits) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        Self::prune(&tx, limits, now())?;
+        tx.commit()?;
+        self.limits = limits;
+        Ok(())
+    }
+
+    fn list(
+        &self,
+        before: Option<i64>,
+        query: Option<&str>,
+    ) -> rusqlite::Result<Vec<HistoryEntry>> {
         let mut statement = self.db.prepare(
             "SELECT id, timestamp, media, sent, peer, size FROM entries
-             WHERE id <= ?1 ORDER BY id DESC LIMIT ?2",
+             WHERE id <= ?1 AND CASE
+               WHEN ?3 IS NULL THEN 1
+               WHEN media = 0 THEN instr(lower(CAST(payload AS TEXT)), lower(?3)) > 0
+               ELSE 0 END
+             ORDER BY id DESC LIMIT ?2",
         )?;
         statement
             .query_map(
                 params![
                     before.map_or(i64::MAX, |id| id.saturating_sub(1)),
-                    (HISTORY_PER_PAGE + 1) as u32
+                    (HISTORY_PER_PAGE + 1) as u32,
+                    query
                 ],
                 |row| {
                     let peer: NoiseKey = row.get(4)?;
@@ -409,12 +548,13 @@ impl Store {
             .collect()
     }
 
-    fn load(&self, id: i64) -> rusqlite::Result<Option<(Media, Bytes)>> {
+    fn load(&self, id: i64, preview: bool) -> rusqlite::Result<Option<(Media, Bytes)>> {
         self.db
             .query_row(
-                "SELECT media, payload FROM entries WHERE id=?1 AND size=length(payload)
+                "SELECT media, CASE WHEN ?4 AND media=0 THEN CAST(substr(CAST(payload AS TEXT), 1, 160) AS BLOB)
+                   ELSE payload END FROM entries WHERE id=?1 AND size=length(payload)
              AND size BETWEEN 1 AND CASE media WHEN 0 THEN ?2 ELSE ?3 END",
-                params![id, MAX_BULK_TEXT_BYTES as u32, MAX_IMAGE_BYTES as u32],
+                params![id, MAX_BULK_TEXT_BYTES as u32, MAX_IMAGE_BYTES as u32, preview],
                 |row| {
                     let kind = media(row.get(0)?)?;
                     let bytes = row.get_ref(1)?.as_blob()?;
@@ -438,23 +578,28 @@ impl Store {
     ) -> rusqlite::Result<Result<Output>> {
         use Operation::*;
         let reply = match operation {
-            Status => Reply::HistoryStatus(Some(self.limits)),
+            Status | Configuration | Configure(_) => unreachable!(),
             Record(direction, peer, time, payload) => {
                 self.record(direction, peer, time, &payload)?;
                 *failed = false;
                 Reply::Ok
             }
-            List(before) => {
+            List(before, query) => {
+                if query.as_ref().is_some_and(|query| {
+                    query.len() > MAX_HISTORY_QUERY_BYTES || query.contains('\0')
+                }) {
+                    return Ok(Err("Search must be at most 256 UTF-8 bytes.".into()));
+                }
                 self.expire(now())?;
-                let mut entries = self.list(before)?;
+                let mut entries = self.list(before, query.as_deref())?;
                 let more = entries.len() > HISTORY_PER_PAGE;
                 entries.truncate(HISTORY_PER_PAGE);
                 Reply::HistoryPage { entries, more }
             }
-            Load(id) => {
+            Load(id) | Preview(id) => {
                 self.expire(now())?;
                 return Ok(self
-                    .load(id)?
+                    .load(id, matches!(operation, Preview(_)))?
                     .map(|(media, bytes)| Output::Payload(media, bytes))
                     .ok_or_else(|| "History entry was not found or has expired.".into()));
             }
@@ -532,14 +677,14 @@ mod tests {
             );
             assert_eq!(
                 store
-                    .list(None)
+                    .list(None, None)
                     .unwrap()
                     .iter()
                     .map(|entry| entry.id)
                     .collect::<Vec<_>>(),
                 [3, 2]
             );
-            assert_eq!(store.list(Some(3)).unwrap()[0].id, 2);
+            assert_eq!(store.list(Some(3), None).unwrap()[0].id, 2);
             // Backdate one saved item. Restart must prune it before exposing a list.
             store
                 .db
@@ -550,24 +695,24 @@ mod tests {
                 .unwrap();
         }
         let mut store = Store::open(&profile, limits(2, 100)).unwrap();
-        let entries = store.list(None).unwrap();
+        let entries = store.list(None, None).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 3);
         assert!(matches!(entries[0].direction, HistoryDirection::Sent));
         assert_eq!(entries[0].peer, "ff".repeat(32));
-        let (media, bytes) = store.load(3).unwrap().unwrap();
+        let (media, bytes) = store.load(3, false).unwrap().unwrap();
         assert_eq!(media, Media::Text);
         assert_eq!(&*bytes, text.bytes());
         let mut failed = false;
         assert!(store.request(Operation::Delete(3), &mut failed).is_ok());
-        assert!(store.load(3).unwrap().is_none());
+        assert!(store.load(3, false).unwrap().is_none());
         insert(&mut store, &text);
         assert!(store.request(Operation::Clear, &mut failed).is_ok());
         drop(store);
         assert!(
             Store::open(&profile, limits(2, 100))
                 .unwrap()
-                .list(None)
+                .list(None, None)
                 .unwrap()
                 .is_empty()
         );
@@ -582,20 +727,20 @@ mod tests {
         let medium = Payload::text("a".repeat(514 * 1024)).unwrap();
         insert(&mut store, &medium);
         insert(&mut store, &medium);
-        assert_eq!(store.list(None).unwrap()[0].id, 2);
-        assert_eq!(store.list(None).unwrap().len(), 1);
+        assert_eq!(store.list(None, None).unwrap()[0].id, 2);
+        assert_eq!(store.list(None, None).unwrap().len(), 1);
         let tiny = Payload::text("b".into()).unwrap();
         insert(&mut store, &tiny);
         let near_limit = Payload::text("a".repeat(MIB as usize - 1)).unwrap();
         insert(&mut store, &near_limit);
-        assert_eq!(store.list(None).unwrap().len(), 2);
+        assert_eq!(store.list(None, None).unwrap().len(), 2);
         // These payloads fit the byte quota together, but the SQLite database exceeds it
         // once the table and index pages are included.
         let half = Payload::text("c".repeat(512 * 1024)).unwrap();
         insert(&mut store, &half);
         insert(&mut store, &half);
         assert!(fs::metadata(path).unwrap().len() <= MIB as u64);
-        assert_eq!(store.list(None).unwrap().len(), 1);
+        assert_eq!(store.list(None, None).unwrap().len(), 1);
     }
 
     #[test]

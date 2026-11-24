@@ -7,6 +7,8 @@ mod history;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
+mod preferences;
+#[cfg(target_os = "linux")]
 mod server;
 
 #[derive(Parser)]

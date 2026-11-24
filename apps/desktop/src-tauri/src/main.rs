@@ -21,6 +21,18 @@ fn main() -> tauri::Result<()> {
             pair_status,
             pair_confirm,
             pair_cancel,
+            clipboard_preferences,
+            set_clipboard_sending,
+            set_clipboard_application,
+            set_clipboard_recipient,
+            history_configuration,
+            configure_history,
+            history_page,
+            history_preview,
+            restore_history,
+            resend_history,
+            delete_history,
+            clear_history,
         ])
         .run(tauri::generate_context!())
 }

@@ -3,8 +3,12 @@
 use std::io::Cursor;
 
 use image::{
-    ImageDecoder, Limits,
-    codecs::{jpeg::JpegDecoder, png::PngDecoder, webp::WebPDecoder},
+    ColorType, ImageDecoder, ImageEncoder, Limits,
+    codecs::{
+        jpeg::JpegDecoder,
+        png::{PngDecoder, PngEncoder},
+        webp::WebPDecoder,
+    },
 };
 pub use lyteboard_protocol::peer::Media;
 use lyteboard_protocol::peer::{CHUNK_BYTES, Manifest, PeerFailure, TransferId};
@@ -172,6 +176,74 @@ impl Receiver {
 }
 
 fn validate_image(media: Media, bytes: &[u8]) -> Result<(), Error> {
+    decode_image(media, bytes, |_, _, _, _| Ok(()))
+}
+
+/// Decode a validated, bounded clipboard image and return a thumbnail at most 128 pixels per axis.
+pub async fn thumbnail(
+    media: Media,
+    bytes: Zeroizing<Vec<u8>>,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    validate_size(media, bytes.len())?;
+    let permit = VALIDATION.acquire().await.map_err(|_| Error::Validation)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_image(media, &bytes, sample_thumbnail)
+    })
+    .await
+    .map_err(|_| Error::Validation)?
+}
+
+fn sample_thumbnail(
+    color: ColorType,
+    width: u32,
+    height: u32,
+    bytes: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let scale = width.max(height).max(128);
+    let columns = (width * 128 / scale).max(1);
+    let rows = (height * 128 / scale).max(1);
+    let channels = usize::from(color.channel_count());
+    let stride = usize::from(color.bytes_per_pixel());
+    let mut pixels = Zeroizing::new(Vec::with_capacity((columns * rows) as usize * channels));
+    for y in 0..rows {
+        for x in 0..columns {
+            let start = ((y * height / rows) * width + x * width / columns) as usize * stride;
+            let pixel = &bytes[start..start + stride];
+            if stride == channels {
+                pixels.extend_from_slice(pixel);
+            } else if stride == channels * 2 {
+                pixels.extend(
+                    pixel
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|channel| (u16::from_ne_bytes(*channel) >> 8) as u8),
+                );
+            } else {
+                return Err(Error::Image);
+            }
+        }
+    }
+    let mut output = Zeroizing::new(Vec::new());
+    let target = match channels {
+        1 => ColorType::L8,
+        2 => ColorType::La8,
+        3 => ColorType::Rgb8,
+        4 => ColorType::Rgba8,
+        _ => return Err(Error::Image),
+    };
+    PngEncoder::new(&mut *output)
+        .write_image(&pixels, columns, rows, target.into())
+        .map_err(image_error)?;
+    Ok(output)
+}
+
+fn decode_image<T>(
+    media: Media,
+    bytes: &[u8],
+    consume: impl FnOnce(ColorType, u32, u32, &[u8]) -> Result<T, Error>,
+) -> Result<T, Error> {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_AXIS);
     limits.max_image_height = Some(MAX_AXIS);
@@ -183,11 +255,13 @@ fn validate_image(media: Media, bytes: &[u8]) -> Result<(), Error> {
             if decoder.is_apng().map_err(image_error)? {
                 return Err(Error::Animation);
             }
-            decode(decoder, limits)
+            decode(decoder, limits, consume)
         }
-        Media::Jpeg if bytes.starts_with(b"\xff\xd8") && bytes.ends_with(b"\xff\xd9") => {
-            decode(JpegDecoder::new(cursor).map_err(image_error)?, limits)
-        }
+        Media::Jpeg if bytes.starts_with(b"\xff\xd8") && bytes.ends_with(b"\xff\xd9") => decode(
+            JpegDecoder::new(cursor).map_err(image_error)?,
+            limits,
+            consume,
+        ),
         Media::Webp
             if bytes.len() >= 12
                 && &bytes[..4] == b"RIFF"
@@ -199,13 +273,17 @@ fn validate_image(media: Media, bytes: &[u8]) -> Result<(), Error> {
             if decoder.has_animation() {
                 return Err(Error::Animation);
             }
-            decode(decoder, limits)
+            decode(decoder, limits, consume)
         }
         _ => Err(Error::Image),
     }
 }
 
-fn decode(mut decoder: impl ImageDecoder, limits: Limits) -> Result<(), Error> {
+fn decode<T>(
+    mut decoder: impl ImageDecoder,
+    limits: Limits,
+    consume: impl FnOnce(ColorType, u32, u32, &[u8]) -> Result<T, Error>,
+) -> Result<T, Error> {
     let (width, height) = decoder.dimensions();
     if width == 0
         || height == 0
@@ -216,7 +294,9 @@ fn decode(mut decoder: impl ImageDecoder, limits: Limits) -> Result<(), Error> {
     }
     decoder.set_limits(limits).map_err(image_error)?;
     let mut output = Zeroizing::new(vec![0; decoder.total_bytes() as usize]);
-    decoder.read_image(&mut output).map_err(image_error)
+    let color = decoder.color_type();
+    decoder.read_image(&mut output).map_err(image_error)?;
+    consume(color, width, height, &output)
 }
 
 fn image_error(error: image::ImageError) -> Error {
@@ -232,6 +312,20 @@ mod tests {
     use super::*;
     use image::{DynamicImage, ImageFormat, RgbImage};
     use lyteboard_protocol::peer::{MAX_BULK_TEXT_BYTES, MAX_IMAGE_BYTES};
+
+    #[tokio::test]
+    async fn history_thumbnail_keeps_aspect_ratio_and_has_bounded_output() {
+        let source = image(ImageFormat::Png, 400, 200);
+        let preview = thumbnail(Media::Png, Zeroizing::new(source)).await.unwrap();
+        let decoded = ::image::load_from_memory_with_format(&preview, ImageFormat::Png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (128, 64));
+        assert!(preview.len() <= lyteboard_protocol::ipc::network::MAX_HISTORY_PREVIEW_BYTES);
+        assert!(
+            thumbnail(Media::Png, Zeroizing::new(vec![1]))
+                .await
+                .is_err()
+        );
+    }
 
     fn image(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());

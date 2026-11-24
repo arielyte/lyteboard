@@ -101,8 +101,8 @@ def exercise(root, cleanup, x11):
     a_clip.seed(b"Do not replay across reconnection", sensitive=False)
     wait_for(lambda: "Do not replay across reconnection" in beta.cli("received"))
     gamma.start()
-    assert status(gamma) == ["Automatic clipboard sending off"]
-    assert gamma.cli("clipboard", "auto") == "Automatic clipboard application off"
+    assert status(gamma) == ["Automatic clipboard sending on", *sorted((a_key, b_key))]
+    assert gamma.cli("clipboard", "auto") == "Automatic clipboard application on"
     wait_for(lambda: alpha.online(c_key))
     assert gamma.cli("received") == "No received messages"
     assert len(stable_history(devices)[2]) == 3

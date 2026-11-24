@@ -2368,6 +2368,7 @@ dependencies = [
  "mdns-sd",
  "rusqlite",
  "rustix",
+ "serde",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2378,6 +2379,7 @@ dependencies = [
 name = "lyteboard-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "hex",
  "lyteboard-core",
  "lyteboard-protocol",

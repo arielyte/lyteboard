@@ -16,7 +16,7 @@ use lyteboard_core::ipc::linux::{
 use lyteboard_protocol::{
     ipc::{
         self, DecodeError, ErrorCode, Request, Response, Status,
-        network::{Command, HistoryCommand, MAX_RECIPIENTS, Reply},
+        network::{Command, HistoryCommand, MAX_HISTORY_PREVIEW_BYTES, MAX_RECIPIENTS, Reply},
     },
     peer::{Media, NoiseKey},
 };
@@ -32,6 +32,7 @@ use tokio::{
 use crate::{
     history::{History, Operation as HistoryOperation},
     network::{Network, profile_path},
+    preferences::{HistorySettings, Preferences},
 };
 
 const MAX_CLIENTS: usize = 32;
@@ -40,6 +41,8 @@ const MAX_CLIENTS: usize = 32;
 pub enum DaemonError {
     #[error("could not start the LAN worker: {0}")]
     Network(#[source] io::Error),
+    #[error("could not start the history worker: {0}")]
+    History(#[source] io::Error),
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
     #[error("could not register signal handlers: {0}")]
@@ -55,9 +58,11 @@ pub async fn run() -> Result<(), DaemonError> {
     let endpoint = Endpoint::from_env()?;
     let server = ServerSocket::bind(&endpoint).await?;
     let profile = profile_path();
-    let history = History::start(profile.clone());
+    let preferences = Preferences::load(profile.clone());
+    let history =
+        History::start(profile.clone(), preferences.clone()).map_err(DaemonError::History)?;
     let (network, network_done) =
-        Network::start(profile, history.clone()).map_err(DaemonError::Network)?;
+        Network::start(profile, history.clone(), preferences).map_err(DaemonError::Network)?;
     let started = Instant::now();
     let connections_accepted = Arc::new(AtomicU64::new(0));
     let mut handlers = JoinSet::new();
@@ -131,6 +136,36 @@ async fn handle(
             };
             Response::Network(reply)
         }
+        Ok(Ok(Request::Network(Command::History(HistoryCommand::Preview { id })))) => {
+            let Ok(_slot) = bulk_slots.try_acquire_owned() else {
+                let reply =
+                    Response::Network(Reply::Error("Local bulk transfers are busy.".into()));
+                let _ = timeout(REQUEST_TIMEOUT, send(&mut stream, &reply)).await;
+                return None;
+            };
+            let _ = timeout(BULK_TIMEOUT, async {
+                let item = history.preview(id).await.and_then(|(media, bytes)| {
+                    if bytes.len() <= MAX_HISTORY_PREVIEW_BYTES {
+                        Ok((media, bytes))
+                    } else {
+                        Err("History preview exceeds its size limit.".into())
+                    }
+                });
+                match item {
+                    Ok((media, bytes)) => {
+                        let reply = Response::Network(Reply::BulkItem {
+                            media,
+                            size: bytes.len() as u32,
+                        });
+                        send(&mut stream, &reply).await?;
+                        write_bulk(&mut stream, &bytes).await
+                    }
+                    Err(error) => send(&mut stream, &Response::Network(Reply::Error(error))).await,
+                }
+            })
+            .await;
+            return None;
+        }
         Ok(Ok(Request::Network(
             command @ (Command::BulkDownload { .. }
             | Command::History(HistoryCommand::Restore { .. })),
@@ -176,14 +211,30 @@ async fn handle(
         Ok(Ok(Request::Network(Command::History(command)))) => {
             let reply = match command {
                 HistoryCommand::Status => history.control(HistoryOperation::Status).await,
+                HistoryCommand::Configuration => {
+                    history.control(HistoryOperation::Configuration).await
+                }
+                HistoryCommand::Configure { enabled, limits } => {
+                    history
+                        .control(HistoryOperation::Configure(HistorySettings {
+                            enabled,
+                            limits,
+                        }))
+                        .await
+                }
                 HistoryCommand::List { before } => {
-                    history.control(HistoryOperation::List(before)).await
+                    history.control(HistoryOperation::List(before, None)).await
+                }
+                HistoryCommand::Search { before, query } => {
+                    history
+                        .control(HistoryOperation::List(before, Some(query)))
+                        .await
                 }
                 HistoryCommand::Delete { id } => {
                     history.control(HistoryOperation::Delete(id)).await
                 }
                 HistoryCommand::Clear => history.control(HistoryOperation::Clear).await,
-                HistoryCommand::Restore { .. } => unreachable!(),
+                HistoryCommand::Restore { .. } | HistoryCommand::Preview { .. } => unreachable!(),
                 HistoryCommand::Resend { id, peers } => {
                     let operation = async {
                         let peers = parse_peers(peers)?;

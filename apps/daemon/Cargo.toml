@@ -25,6 +25,7 @@ getrandom = "0.4.3"
 hex = "0.4"
 if-addrs = "0.15"
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+serde.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

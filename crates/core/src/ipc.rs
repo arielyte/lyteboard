@@ -129,6 +129,19 @@ impl Client {
         .await
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn download_history_preview(
+        &self,
+        id: i64,
+    ) -> Result<Option<(lyteboard_protocol::peer::Media, zeroize::Zeroizing<Vec<u8>>)>, ClientError>
+    {
+        linux::download(
+            &self.endpoint,
+            network::Command::History(network::HistoryCommand::Preview { id }),
+        )
+        .await
+    }
+
     async fn request(&self, request: Request) -> Result<Response, ClientError> {
         #[cfg(target_os = "linux")]
         return linux::request(&self.endpoint, request).await;

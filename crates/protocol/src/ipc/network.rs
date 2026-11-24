@@ -10,6 +10,8 @@ pub const MAX_TEST_TEXT_BYTES: usize = 512;
 pub const DEVICES_PER_PAGE: usize = 4;
 pub const MAX_RECIPIENTS: usize = 32;
 pub const HISTORY_PER_PAGE: usize = 16;
+pub const MAX_HISTORY_QUERY_BYTES: usize = 256;
+pub const MAX_HISTORY_PREVIEW_BYTES: usize = 128 * 1024;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -70,6 +72,7 @@ pub enum Command {
         enabled: bool,
     },
     ClipboardSync(ClipboardSyncCommand),
+    ClipboardPreferences,
     History(HistoryCommand),
 }
 
@@ -113,6 +116,8 @@ pub enum Reply {
         last_error: Option<String>,
     },
     HistoryStatus(Option<HistoryLimits>),
+    HistoryConfiguration(HistoryConfiguration),
+    ClipboardPreferences(ClipboardPreferences),
     HistoryPage {
         entries: Vec<HistoryEntry>,
         more: bool,
@@ -131,10 +136,31 @@ pub enum ClipboardSyncCommand {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum HistoryCommand {
     Status,
-    List { before: Option<i64> },
-    Restore { id: i64 },
-    Resend { id: i64, peers: Vec<String> },
-    Delete { id: i64 },
+    Configuration,
+    Configure {
+        enabled: bool,
+        limits: HistoryLimits,
+    },
+    List {
+        before: Option<i64>,
+    },
+    Search {
+        before: Option<i64>,
+        query: String,
+    },
+    Preview {
+        id: i64,
+    },
+    Restore {
+        id: i64,
+    },
+    Resend {
+        id: i64,
+        peers: Vec<String>,
+    },
+    Delete {
+        id: i64,
+    },
     Clear,
 }
 
@@ -144,6 +170,42 @@ pub struct HistoryLimits {
     pub entries: u32,
     pub mib: u32,
     pub days: u32,
+}
+
+impl Default for HistoryLimits {
+    fn default() -> Self {
+        Self {
+            entries: 100,
+            mib: 100,
+            days: 7,
+        }
+    }
+}
+
+impl HistoryLimits {
+    pub fn is_valid(self) -> bool {
+        (1..=10_000).contains(&self.entries)
+            && (1..=1024).contains(&self.mib)
+            && (1..=3650).contains(&self.days)
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryConfiguration {
+    pub enabled: bool,
+    pub limits: HistoryLimits,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardPreferences {
+    pub send: bool,
+    pub apply: bool,
+    pub peers: Vec<String>,
+    pub send_active: bool,
+    pub apply_active: bool,
+    pub send_error: Option<String>,
+    pub apply_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -320,6 +382,28 @@ mod tests {
             format!("{qr:?} {code:?}"),
             "Network(NetworkCommand([redacted])) Network(NetworkReply([redacted]))"
         );
+    }
+
+    #[test]
+    fn history_search_and_preferences_fit_control_frames_and_debug_is_redacted() {
+        let search = Request::Network(Command::History(HistoryCommand::Search {
+            query: "\\".repeat(MAX_HISTORY_QUERY_BYTES),
+            before: Some(i64::MAX),
+        }));
+        let encoded = encode(&search).unwrap();
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
+        assert_eq!(decode::<Request>(&encoded).unwrap(), search);
+        assert!(!format!("{search:?}").contains("\\\\"));
+        let preferences = Response::Network(Reply::ClipboardPreferences(ClipboardPreferences {
+            send: true,
+            apply: true,
+            peers: vec!["ff".repeat(32); MAX_RECIPIENTS],
+            send_active: false,
+            apply_active: false,
+            send_error: Some("a".repeat(512)),
+            apply_error: Some("b".repeat(512)),
+        }));
+        assert!(encode(&preferences).unwrap().len() <= MAX_FRAME_BYTES);
     }
 
     #[test]

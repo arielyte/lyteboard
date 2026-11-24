@@ -200,6 +200,10 @@ code,
   background: var(--sidebar);
   border-right: 1px solid var(--border);
   padding: 20px 11px 17px;
+  position: sticky;
+  inset-block-start: 0;
+  align-self: start;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   gap: 25px;
@@ -579,6 +583,8 @@ dialog::backdrop {
     padding: 10px 12px 6px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
+    height: auto;
+    z-index: 2;
   }
   .sidebar nav {
     grid-area: 2 / 1 / 3 / 3;
@@ -603,4 +609,92 @@ dialog::backdrop {
   .page-header {
     margin-bottom: 12px;
   }
+}
+
+.history-controls,
+.history-meta,
+.retention-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.history-controls {
+  align-items: end;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.history-controls .field-row {
+  flex: 1 1 16rem;
+}
+.history-list {
+  list-style: none;
+  padding: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.history-entry {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.history-entry + .history-entry {
+  border-top: 1px solid var(--border);
+}
+.history-meta {
+  align-items: baseline;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+.history-meta strong {
+  color: var(--ink);
+  font-size: 0.95rem;
+  overflow-wrap: anywhere;
+}
+.history-preview {
+  min-height: 20px;
+}
+.history-preview p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 4.5em;
+  overflow: hidden;
+}
+.history-preview img {
+  display: block;
+  max-width: 128px;
+  max-height: 96px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+}
+.history-pagination {
+  margin-top: 12px;
+}
+.history-screen .message button {
+  margin-top: 8px;
+}
+.preference-checks {
+  display: grid;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 400;
+}
+.preference-toggle {
+  cursor: pointer;
+}
+.retention-fields label {
+  flex: 1 1 8rem;
+}
+.preference-retry {
+  justify-self: start;
+}
+.privacy-list {
+  padding-inline-start: 18px;
+  color: var(--muted);
 }

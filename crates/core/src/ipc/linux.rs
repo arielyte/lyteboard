@@ -175,11 +175,19 @@ pub(super) async fn download(
     endpoint: &Endpoint,
     command: Command,
 ) -> Result<Option<(Media, Zeroizing<Vec<u8>>)>, ClientError> {
+    use crate::ipc::network::{HistoryCommand, MAX_HISTORY_PREVIEW_BYTES};
+    let preview = matches!(command, Command::History(HistoryCommand::Preview { .. }));
     timeout(BULK_TIMEOUT, async {
         let mut stream = connect(endpoint).await?;
         send(&mut stream, &Request::Network(command)).await?;
         match bulk_reply(&mut stream).await? {
             Reply::BulkItem { media, size } => {
+                if preview
+                    && (size as usize > MAX_HISTORY_PREVIEW_BYTES
+                        || !matches!(media, Media::Text | Media::Png))
+                {
+                    return Err(ClientError::UnexpectedResponse);
+                }
                 Ok(Some((media, read_bulk(&mut stream, media, size).await?)))
             }
             Reply::NoBulkItem => Ok(None),

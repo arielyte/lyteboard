@@ -3,7 +3,7 @@ use lyteboard_core::{
     clipboard::Clipboard,
     ipc::{
         Client,
-        network::{Command, HistoryCommand as Request, HistoryDirection, Reply},
+        network::{Command, HistoryCommand as Request, HistoryDirection, HistoryLimits, Reply},
     },
 };
 
@@ -17,11 +17,27 @@ use crate::{
 pub enum HistoryCommand {
     /// Show whether persistent history is enabled and its retention limits.
     Status,
+    /// Enable persistent clipboard history.
+    Enable,
+    /// Disable history and keep the saved database.
+    Disable,
+    /// Set the maximum entries, MiB, and days to retain.
+    Retention {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        entries: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1024))]
+        mib: u32,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3650))]
+        days: u32,
+    },
     /// List entry metadata from newest to oldest, one page at a time.
     List {
         /// Continue with entries older than this ID.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         before: Option<i64>,
+        /// Find literal text in saved text items.
+        #[arg(long)]
+        search: Option<String>,
     },
     /// Copy a saved entry into the local clipboard.
     Restore {
@@ -58,9 +74,48 @@ pub async fn run(client: &Client, command: HistoryCommand) -> Result<(), Command
             Reply::HistoryStatus(None) => println!("History off"),
             _ => return Err(unexpected()),
         },
-        HistoryCommand::List { before } => {
-            let Reply::HistoryPage { entries, more } =
-                request(client, Command::History(Request::List { before })).await?
+        HistoryCommand::Enable | HistoryCommand::Disable | HistoryCommand::Retention { .. } => {
+            let Reply::HistoryConfiguration(current) =
+                request(client, Command::History(Request::Configuration)).await?
+            else {
+                return Err(unexpected());
+            };
+            let (enabled, limits) = match command {
+                HistoryCommand::Enable => (true, current.limits),
+                HistoryCommand::Disable => (false, current.limits),
+                HistoryCommand::Retention { entries, mib, days } => {
+                    (current.enabled, HistoryLimits { entries, mib, days })
+                }
+                _ => unreachable!(),
+            };
+            let Reply::HistoryConfiguration(saved) = request(
+                client,
+                Command::History(Request::Configure { enabled, limits }),
+            )
+            .await?
+            else {
+                return Err(unexpected());
+            };
+            if let Some(error) = saved.error {
+                return Err(CommandError::Network(error));
+            }
+            println!(
+                "History {} ({} entries, {} MiB, {} days)",
+                if saved.enabled { "on" } else { "off" },
+                saved.limits.entries,
+                saved.limits.mib,
+                saved.limits.days
+            );
+        }
+        HistoryCommand::List { before, search } => {
+            let Reply::HistoryPage { entries, more } = request(
+                client,
+                Command::History(match search {
+                    Some(query) => Request::Search { before, query },
+                    None => Request::List { before },
+                }),
+            )
+            .await?
             else {
                 return Err(unexpected());
             };

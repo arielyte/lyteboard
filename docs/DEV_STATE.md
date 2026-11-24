@@ -186,6 +186,44 @@ PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py --lan-ip "$l
 
 The locked Tauri release build, TypeScript, lint, formatting, desktop Clippy, and all 81 affected Rust tests passed. The native WebKit window passed against three isolated daemons in KWin Wayland. Verification covered offline recovery, both themes, QR decoding and cancellation, invitation import and comparison, text and PNG sends, transfer errors, actual on-host mDNS, listener and peer address changes, renaming and revocation, and daemon survival after window close. Verification used one Linux host.
 
+## LAN-5B checkpoint
+
+History shows real sent and received entries, local timestamps, content types, and device names where the peer is still paired. It pages through 16 entries at a time, searches saved text, and supports restore, resend, delete, and confirmed clear. Search matches literal substrings, folds ASCII case, and matches other characters exactly. Disabled history and unavailable storage have separate states. History refreshes on navigation or with **Refresh history**.
+
+Visible previews load on demand through the authenticated Unix bulk stream. Text previews contain at most 160 characters. PNG, JPEG, and WebP previews are decoded under the transfer validator’s existing limits, resized to at most 128 pixels per axis, and returned as PNGs. The desktop receives thumbnails in memory without a filesystem grant. Restore and resend use the full saved payload. IPC control frames remain capped at 4 KiB.
+
+The daemon saves explicit clipboard, history retention, discovery, and listener preferences in the profile’s private `preferences.json` using atomic replacement. Automatic sending, automatic application, and persistent history default off. Turning off history preserves the database, and lowering active retention can remove entries immediately. Automatic sending only resumes for still-trusted selected recipients and skips the clipboard already present at startup. An unavailable graphical session leaves the saved preference visible with an inactive status. The appearance preference belongs to the desktop. An explicit `LYTEBOARD_LISTEN_ADDR` environment setting takes precedence at startup. History and discovery environment values are fallbacks until saved settings exist.
+
+Settings explains end-to-end encryption, LAN-only communication, unencrypted local history, and the possibility of sharing unmarked sensitive clipboard content. The CLI updates the same daemon preferences.
+
+```sh
+lyteboard history enable
+lyteboard history retention --entries 100 --mib 100 --days 7
+lyteboard history list --search 'example'
+lyteboard history disable
+lyteboard clipboard sync status
+lyteboard clipboard auto status
+```
+
+Verification from the repository root, with the graphical test prerequisites listed under LAN-5A:
+
+```sh
+cargo build --locked -p lyteboard-daemon -p lyteboard-cli
+npm --prefix apps/desktop run format:check
+npm --prefix apps/desktop run lint
+npm --prefix apps/desktop run typecheck
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+cargo test --locked -p lyteboard-core -p lyteboard-protocol -p lyteboard-daemon -p lyteboard-cli -p lyteboard-desktop
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/history_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_sync_cli.py
+```
+
+All 84 affected Rust tests passed, along with Clippy, frontend formatting, lint, typecheck, the frontend build, and the locked Tauri release build. The native WebKit harness passed in isolated KWin Wayland sessions against three real daemons, including text and image restoration, thumbnails, search, pagination, resend, delete, clear confirmation, disabled history, corrupt storage, and preference recovery after an offline restart. The history, clipboard, LAN, and real KWin synchronization CLI harnesses also passed.
+
+Full history items remain available for copying or resending. The GUI shows previews only. History search covers text payloads and does not index images. Stored passwords and other sensitive clipboard content can be readable by same-user processes and backups. System tray and automatic daemon startup remain deferred.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.

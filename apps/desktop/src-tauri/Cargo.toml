@@ -16,6 +16,7 @@ tauri-build = { version = "2.7.6", features = [] }
 [dependencies]
 lyteboard-core.workspace = true
 lyteboard-protocol.workspace = true
+base64 = "0.23"
 hex = "0.4"
 qrcode = { version = "0.15", default-features = false }
 serde.workspace = true
