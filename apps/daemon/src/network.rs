@@ -30,6 +30,8 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
+use crate::history::History;
+
 use bulk::{Batch, Inbox};
 use clipboard::AutoClipboard;
 use discovery::{Discovery, Hints, LocalNetworks};
@@ -50,7 +52,10 @@ enum Output {
 }
 
 impl Network {
-    pub fn start() -> io::Result<(Self, oneshot::Receiver<()>)> {
+    pub fn start(
+        profile: Option<PathBuf>,
+        history: History,
+    ) -> io::Result<(Self, oneshot::Receiver<()>)> {
         let (tx, rx) = mpsc::channel(32);
         let (finished, done) = oneshot::channel();
         let runtime = runtime::Builder::new_current_thread()
@@ -59,7 +64,7 @@ impl Network {
         std::thread::Builder::new()
             .name("lyteboard-lan".into())
             .spawn(move || {
-                LocalSet::new().block_on(&runtime, Worker::new().run(rx));
+                LocalSet::new().block_on(&runtime, Worker::new(profile, history).run(rx));
                 let _ = finished.send(());
             })?;
         Ok((Self(tx), done))
@@ -126,6 +131,7 @@ struct Activity {
     incoming_bulk: Arc<Semaphore>,
     outgoing_bulk: Arc<Semaphore>,
     clipboard: AutoClipboard,
+    history: History,
 }
 
 struct PairJob {
@@ -136,19 +142,22 @@ struct PairJob {
 
 type Shared = Rc<RefCell<Activity>>;
 
+pub(super) fn profile_path() -> Option<PathBuf> {
+    env::var_os("LYTEBOARD_PROFILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let data_dir = env::var_os("XDG_DATA_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+                });
+            data_dir.map(|path| path.join("lyteboard"))
+        })
+}
+
 impl Worker {
-    fn new() -> Self {
-        let profile = env::var_os("LYTEBOARD_PROFILE")
-            .map(PathBuf::from)
-            .or_else(|| {
-                let data_dir = env::var_os("XDG_DATA_HOME")
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-                    });
-                data_dir.map(|path| path.join("lyteboard"))
-            });
+    fn new(profile: Option<PathBuf>, history: History) -> Self {
         let name = env::var("LYTEBOARD_DEVICE_NAME").unwrap_or_else(|_| "Lyteboard".into());
         let label = if name.trim().is_empty() || validate_label(&name).is_err() {
             Err(format!(
@@ -175,6 +184,7 @@ impl Worker {
                 incoming_bulk: Arc::new(Semaphore::new(2)),
                 outgoing_bulk: Arc::new(Semaphore::new(2)),
                 clipboard: AutoClipboard::default(),
+                history,
             })),
         }
     }
@@ -319,7 +329,7 @@ impl Worker {
             .try_acquire_owned()
             .map_err(|_| "Bulk sending is busy. Retry after the current transfers.")?;
         let batch = Arc::new(Batch {
-            payload,
+            payload: Arc::new(payload),
             _slot: slot,
         });
         let outcomes = peers
@@ -508,7 +518,7 @@ impl Worker {
                 .sessions
                 .delivery(id)
                 .map(Reply::Delivery),
-            Command::BulkUpload { .. } | Command::BulkDownload { .. } => {
+            Command::BulkUpload { .. } | Command::BulkDownload { .. } | Command::History(_) => {
                 Err("Use the bulk stream.".into())
             }
             Command::Received { offset } => Ok(Reply::Received(

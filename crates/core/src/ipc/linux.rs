@@ -173,15 +173,11 @@ pub(super) async fn upload(
 
 pub(super) async fn download(
     endpoint: &Endpoint,
-    offset: usize,
+    command: Command,
 ) -> Result<Option<(Media, Zeroizing<Vec<u8>>)>, ClientError> {
     timeout(BULK_TIMEOUT, async {
         let mut stream = connect(endpoint).await?;
-        send(
-            &mut stream,
-            &Request::Network(Command::BulkDownload { offset }),
-        )
-        .await?;
+        send(&mut stream, &Request::Network(command)).await?;
         match bulk_reply(&mut stream).await? {
             Reply::BulkItem { media, size } => {
                 Ok(Some((media, read_bulk(&mut stream, media, size).await?)))

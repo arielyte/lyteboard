@@ -40,6 +40,56 @@ Bulk records travel in independently encrypted Noise sessions with a random ID p
 
 The daemon allows two incomplete inbound transfers, two outgoing batches that share their payloads across selected recipients, one validation task, and two authenticated local bulk streams. Local binary streams use a 20-second deadline after the bounded control request. Peer transfers use a 10-second progress timeout and a 60-second total deadline. The existing receive buffer holds at most 16 messages or 20 MiB in memory. Partial data is discarded when a transfer fails. IPC control frames remain limited to 4 KiB. [Wire protocol](protocol.md)
 
+## LAN-4C checkpoint
+
+The Linux daemon can save validated incoming clipboard text and images and outgoing content after an authenticated delivery acknowledgment. Each entry records a Unix timestamp in seconds, MIME type, byte count, direction, and the remote device's public Noise ID. A send to multiple devices saves one entry for each acknowledgment. Restoring an item writes the local clipboard. Resending uses the regular encrypted delivery path and requires current trust. Neither feature watches the clipboard.
+
+History is off by default. Set `LYTEBOARD_HISTORY=on` in the daemon's environment before starting it. Existing daemons need a restart to pick up changes. Optional configuration uses the following positive integers.
+
+| Variable | Default | Supported range |
+| --- | --- | --- |
+| `LYTEBOARD_HISTORY_ENTRIES` | 100 entries | 1–10,000 |
+| `LYTEBOARD_HISTORY_MIB` | 100 MiB | 1–1,024 MiB |
+| `LYTEBOARD_HISTORY_DAYS` | 7 days | 1–3,650 days |
+
+The database lives at `history/history.sqlite3` under the daemon profile. The history directory is mode `0700` and the database and lock are `0600`. The daemon validates ownership and file types, uses a dedicated SQLite worker, and commits each record and its retention changes together. Oldest entries are removed first. Expiration runs at startup, on history access and insertion, and about once per minute while enabled. The database size limit includes SQLite pages after commit. A temporary rollback journal can use additional space. An item too large for the configured quota is delivered but omitted from history. Disabling history closes access and pauses cleanup without erasing previous entries.
+
+**SQLite history is unencrypted at rest**, including clipboard bytes and metadata. Private permissions restrict access by other users. Processes running as the same user, administrators, unlocked disks, and backups can expose the database. Deletion and clearing do not guarantee erasure from snapshots, backups, or underlying media. Disk encryption can protect files when its volume is locked. History storage errors leave pairing and clipboard transfer available. `history status` reports an unavailable store, and a stalled or failed write can leave an item absent from history. The daemon leaves damaged databases in place. [SQLite journal and deletion settings](https://www.sqlite.org/pragma.html)
+
+The history list contains metadata only and returns at most 16 entries per page. Restoring uses the existing bounded Unix bulk stream. Resending reads one bounded payload in the daemon and uses the existing transfer queue. All IPC control frames remain limited to 4 KiB.
+
+### History demonstration
+
+Run these commands on an already paired Linux device. Replace `"$peer_id"` with a current device ID from `lyteboard devices list`. Use IDs from `history list` in place of `1` and `2` if the profile already contains history.
+
+```bash
+lyteboard daemon stop
+LYTEBOARD_HISTORY=on lyteboard daemon start
+lyteboard history status
+lyteboard send "$peer_id" 'History demonstration'
+wl-copy --type image/png --sensitive < sample.png
+lyteboard clipboard send "$peer_id"
+lyteboard history list
+lyteboard history restore 2
+wl-paste --no-newline --type image/png | cmp - sample.png
+lyteboard history resend 1 "$peer_id"
+lyteboard history delete 1
+# Voluntarily remove all entries in this demonstration profile.
+lyteboard history clear --yes
+```
+
+If `history list` shows a next-page ID, pass it to `lyteboard history list --before ID`. On X11 use `xclip -selection clipboard -in -target image/png -silent < sample.png` to seed the test image and `xclip -selection clipboard -out -target image/png | cmp - sample.png` to verify restoration.
+
+```sh
+cargo build --locked -p lyteboard-daemon -p lyteboard-cli
+cargo test --locked -p lyteboard-daemon --bin lyteboardd history::
+cargo test --locked -p lyteboard-protocol history_metadata_and_max_recipient_request_fit_control_frames
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/history_cli.py
+cargo test --locked --workspace
+```
+
+The history harness passed using three daemon profiles, real restarts, Unix IPC, Noise, and TCP with simulated clipboard adapters. It verified opt-in behavior, text and image restoration, multi-recipient metadata, resend and revocation, deletion and clearing, pagination, and transfers with an unavailable history database. The Rust tests passed for count, byte and age retention, permissions, corrupt storage, and the 4 KiB control-frame contract. All 78 workspace tests passed, along with the existing simulated clipboard and LAN CLI harnesses, focused Clippy with warnings denied, formatting, and `git diff --check`.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -232,4 +282,4 @@ cargo test --locked --workspace
 
 ## Remaining work
 
-Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic writes cannot reach the display. Persistent clipboard history, continuous clipboard monitoring, and GUI peer controls remain pending.
+Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic writes cannot reach the display. Continuous clipboard monitoring and GUI peer controls remain pending.

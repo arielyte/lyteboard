@@ -16,7 +16,7 @@ use lyteboard_core::ipc::linux::{
 use lyteboard_protocol::{
     ipc::{
         self, DecodeError, ErrorCode, Request, Response, Status,
-        network::{Command, MAX_RECIPIENTS, Reply},
+        network::{Command, HistoryCommand, MAX_RECIPIENTS, Reply},
     },
     peer::{Media, NoiseKey},
 };
@@ -29,7 +29,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::network::Network;
+use crate::{
+    history::{History, Operation as HistoryOperation},
+    network::{Network, profile_path},
+};
 
 const MAX_CLIENTS: usize = 32;
 
@@ -51,7 +54,10 @@ pub async fn run() -> Result<(), DaemonError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(DaemonError::Signals)?;
     let endpoint = Endpoint::from_env()?;
     let server = ServerSocket::bind(&endpoint).await?;
-    let (network, network_done) = Network::start().map_err(DaemonError::Network)?;
+    let profile = profile_path();
+    let history = History::start(profile.clone());
+    let (network, network_done) =
+        Network::start(profile, history.clone()).map_err(DaemonError::Network)?;
     let started = Instant::now();
     let connections_accepted = Arc::new(AtomicU64::new(0));
     let mut handlers = JoinSet::new();
@@ -79,7 +85,7 @@ pub async fn run() -> Result<(), DaemonError> {
 
                 if authenticate(&stream).is_ok() {
                     connections_accepted.fetch_add(1, Ordering::Relaxed);
-                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted), network.clone(), Arc::clone(&bulk_slots)));
+                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted), network.clone(), history.clone(), Arc::clone(&bulk_slots)));
                 }
             }
         }
@@ -88,6 +94,7 @@ pub async fn run() -> Result<(), DaemonError> {
     handlers.shutdown().await;
     drop(network);
     let _ = timeout(Duration::from_millis(500), network_done).await;
+    drop(history);
     drop(server);
     if let Some(mut stream) = shutdown_client {
         // Acknowledgement means the listener and its socket path are already gone.
@@ -102,6 +109,7 @@ async fn handle(
     started: Instant,
     connections_accepted: Arc<AtomicU64>,
     network: Network,
+    history: History,
     bulk_slots: Arc<Semaphore>,
 ) -> Option<UnixStream> {
     let response = match timeout(REQUEST_TIMEOUT, receive::<Request>(&mut stream)).await {
@@ -123,25 +131,36 @@ async fn handle(
             };
             Response::Network(reply)
         }
-        Ok(Ok(Request::Network(Command::BulkDownload { offset }))) => {
+        Ok(Ok(Request::Network(
+            command @ (Command::BulkDownload { .. }
+            | Command::History(HistoryCommand::Restore { .. })),
+        ))) => {
             let Ok(_slot) = bulk_slots.try_acquire_owned() else {
                 let reply =
                     Response::Network(Reply::Error("Local bulk transfers are busy.".into()));
                 let _ = timeout(REQUEST_TIMEOUT, send(&mut stream, &reply)).await;
                 return None;
             };
-            let (reply, item) = match network.download(offset).await {
-                Ok(Some(item)) => (
-                    Reply::BulkItem {
-                        media: item.media(),
-                        size: item.bytes().len() as u32,
-                    },
-                    Some(item),
-                ),
-                Ok(None) => (Reply::NoBulkItem, None),
-                Err(error) => (Reply::Error(error), None),
-            };
             let _ = timeout(BULK_TIMEOUT, async {
+                let result = match command {
+                    Command::BulkDownload { offset } => network.download(offset).await,
+                    Command::History(HistoryCommand::Restore { id }) => history
+                        .load(id)
+                        .await
+                        .map(|payload| Some(Arc::new(payload))),
+                    _ => unreachable!(),
+                };
+                let (reply, item) = match result {
+                    Ok(Some(item)) => (
+                        Reply::BulkItem {
+                            media: item.media(),
+                            size: item.bytes().len() as u32,
+                        },
+                        Some(item),
+                    ),
+                    Ok(None) => (Reply::NoBulkItem, None),
+                    Err(error) => (Reply::Error(error), None),
+                };
                 send(&mut stream, &Response::Network(reply)).await?;
                 if let Some(item) = item {
                     write_bulk(&mut stream, item.bytes()).await?;
@@ -150,6 +169,37 @@ async fn handle(
             })
             .await;
             return None;
+        }
+        Ok(Ok(Request::Network(Command::History(command)))) => {
+            let reply = match command {
+                HistoryCommand::Status => history.control(HistoryOperation::Status).await,
+                HistoryCommand::List { before } => {
+                    history.control(HistoryOperation::List(before)).await
+                }
+                HistoryCommand::Delete { id } => {
+                    history.control(HistoryOperation::Delete(id)).await
+                }
+                HistoryCommand::Clear => history.control(HistoryOperation::Clear).await,
+                HistoryCommand::Restore { .. } => unreachable!(),
+                HistoryCommand::Resend { id, peers } => {
+                    let operation = async {
+                        let peers = parse_peers(peers)?;
+                        let slot = bulk_slots
+                            .try_acquire_owned()
+                            .map_err(|_| "Local bulk transfers are busy.")?;
+                        let payload = history.load(id).await?;
+                        Ok(network.upload(peers, payload, slot).await)
+                    };
+                    match timeout(REQUEST_TIMEOUT - Duration::from_millis(250), operation).await {
+                        Ok(Ok(reply)) => reply,
+                        Ok(Err(error)) => Reply::Error(error),
+                        Err(_) => {
+                            Reply::Error("History resend queue confirmation timed out.".into())
+                        }
+                    }
+                }
+            };
+            Response::Network(reply)
         }
         Ok(Ok(Request::Network(command))) => Response::Network(network.request(command).await),
         Ok(Err(FrameError::Length(0) | FrameError::Decode(DecodeError::Invalid(_)))) => {
@@ -176,20 +226,7 @@ async fn upload(
 ) -> Reply {
     let operation = async {
         validate_size(media, size as usize).map_err(|error| error.to_string())?;
-        if peers.is_empty() || peers.len() > MAX_RECIPIENTS {
-            return Err("Specify one to 32 paired devices.".into());
-        }
-        let mut unique = BTreeSet::new();
-        let peers = peers
-            .into_iter()
-            .map(|id| {
-                let mut peer: NoiseKey = [0; 32];
-                if hex::decode_to_slice(id, &mut peer).is_err() || !unique.insert(peer) {
-                    return Err("Invalid or duplicate device ID.");
-                }
-                Ok(peer)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let peers = parse_peers(peers)?;
 
         send(stream, &Response::Network(Reply::BulkReady))
             .await
@@ -207,4 +244,21 @@ async fn upload(
         Ok(Err(error)) => Reply::Error(error),
         Err(_) => Reply::Error("Local bulk upload timed out.".into()),
     }
+}
+
+fn parse_peers(peers: Vec<String>) -> Result<Vec<NoiseKey>, String> {
+    if peers.is_empty() || peers.len() > MAX_RECIPIENTS {
+        return Err("Specify one to 32 paired devices.".into());
+    }
+    let mut unique = BTreeSet::new();
+    peers
+        .into_iter()
+        .map(|id| {
+            let mut peer: NoiseKey = [0; 32];
+            if hex::decode_to_slice(id, &mut peer).is_err() || !unique.insert(peer) {
+                return Err("Invalid or duplicate device ID.".into());
+            }
+            Ok(peer)
+        })
+        .collect()
 }

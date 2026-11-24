@@ -95,7 +95,7 @@ pub async fn run(client: &Client, command: ClipboardCommand) -> Result<(), Comma
     }
 }
 
-async fn send_clipboard(client: &Client, mut peers: Vec<[u8; 32]>) -> Result<(), CommandError> {
+pub fn selection(mut peers: Vec<[u8; 32]>) -> Result<Vec<[u8; 32]>, CommandError> {
     let mut seen = HashSet::new();
     peers.retain(|peer| seen.insert(*peer));
     if peers.len() > MAX_RECIPIENTS {
@@ -103,12 +103,25 @@ async fn send_clipboard(client: &Client, mut peers: Vec<[u8; 32]>) -> Result<(),
             "Select at most 32 paired devices.".into(),
         ));
     }
+    Ok(peers)
+}
 
+async fn send_clipboard(client: &Client, peers: Vec<[u8; 32]>) -> Result<(), CommandError> {
+    let peers = selection(peers)?;
     let clipboard = Clipboard::for_session().map_err(clipboard_error)?;
     let (media, bytes) = clipboard.read_content().await.map_err(clipboard_error)?;
-    let total = peers.len();
     let keys = peers.iter().map(hex::encode).collect();
     let outcomes = client.upload_bulk(keys, media, &bytes).await?;
+    drop(bytes);
+    report_deliveries(client, peers, outcomes).await
+}
+
+pub async fn report_deliveries(
+    client: &Client,
+    peers: Vec<[u8; 32]>,
+    outcomes: Vec<QueueOutcome>,
+) -> Result<(), CommandError> {
+    let total = peers.len();
     if outcomes.len() != total {
         return Err(unexpected());
     }
@@ -120,7 +133,6 @@ async fn send_clipboard(client: &Client, mut peers: Vec<[u8; 32]>) -> Result<(),
             QueueOutcome::Error(error) => eprintln!("{}: {error}", hex::encode(peer)),
         }
     }
-    drop(bytes);
 
     let deadline = Instant::now() + Duration::from_secs(75);
     while !pending.is_empty() && Instant::now() < deadline {
@@ -156,6 +168,6 @@ async fn send_clipboard(client: &Client, mut peers: Vec<[u8; 32]>) -> Result<(),
     }
 }
 
-fn clipboard_error(error: lyteboard_core::clipboard::Error) -> CommandError {
+pub fn clipboard_error(error: lyteboard_core::clipboard::Error) -> CommandError {
     CommandError::Network(error.to_string())
 }

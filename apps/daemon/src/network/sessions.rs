@@ -5,7 +5,7 @@ use lyteboard_core::{
     peer::{Endpoint, SessionEvent, TrustedDevice, lan},
 };
 use lyteboard_protocol::{
-    ipc::network::{ConnectionState, Delivery, MAX_TEST_TEXT_BYTES},
+    ipc::network::{ConnectionState, Delivery, HistoryDirection, MAX_TEST_TEXT_BYTES},
     peer::{BulkRecord, NoiseKey, PeerFailure, TransferId},
 };
 use tokio::{
@@ -54,8 +54,17 @@ struct Job {
 }
 
 enum Content {
-    Text(String),
+    Text(Arc<Payload>),
     Bulk(Arc<Batch>),
+}
+
+impl Content {
+    fn payload(&self) -> &Arc<Payload> {
+        match self {
+            Self::Text(payload) => payload,
+            Self::Bulk(batch) => &batch.payload,
+        }
+    }
 }
 
 enum Pending {
@@ -63,6 +72,7 @@ enum Pending {
         id: TransferId,
         job: u64,
         deadline: Instant,
+        content: Content,
     },
     Bulk(Outgoing),
 }
@@ -270,7 +280,8 @@ pub(super) fn queue_text(
             "Text must be 1–{MAX_TEST_TEXT_BYTES} UTF-8 bytes without NUL."
         ));
     }
-    queue(activity, endpoint, peer, Content::Text(text))
+    let payload = Payload::text(text).map_err(|error| error.to_string())?;
+    queue(activity, endpoint, peer, Content::Text(Arc::new(payload)))
 }
 
 pub(super) fn queue_bulk(
@@ -459,30 +470,35 @@ async fn run_channel(
                             session.reject_payload(id, PeerFailure::TooLarge).await.map_err(lan_error)?;
                         } else {
                             let payload = Payload::text(text).map_err(|error| error.to_string())?;
-                            publish(activity, peer, payload);
+                            publish(activity, peer, payload).await;
                             session.acknowledge(id).await.map_err(lan_error)?;
                         }
                     }
                     SessionEvent::Bulk(BulkRecord::Credit { id, next }) => {
-                        let Some(Pending::Bulk(transfer)) = &mut pending else {
+                        let Some(Pending::Bulk(mut transfer)) = pending.take() else {
                             return Err("Unexpected bulk credit.".into());
                         };
                         let record = transfer.credit(id, next).map_err(|error| error.to_string())?;
-                        if matches!(record, BulkRecord::End { .. }) {
-                            pending = Some(Pending::Ack {
+                        pending = Some(if matches!(record, BulkRecord::End { .. }) {
+                            Pending::Ack {
                                 id, job: transfer.job, deadline: transfer.expires.min(Instant::now() + ACK_TIMEOUT),
-                            });
-                        }
+                                content: Content::Bulk(transfer.into_batch()),
+                            }
+                        } else {
+                            Pending::Bulk(transfer)
+                        });
                         session.send_bulk(record).await.map_err(lan_error)?;
                     }
                     SessionEvent::Bulk(record) => handle_bulk(activity, &mut session, &mut incoming, record).await?,
                     SessionEvent::DeliveryAck { id, .. } => {
-                        let Some(Pending::Ack { id: expected, job, .. }) = pending.take() else {
+                        let Some(Pending::Ack { id: expected, job, content, .. }) = pending.take() else {
                             return Err("Unexpected delivery acknowledgment.".into());
                         };
                         if expected != id {
                             return Err("Unexpected delivery acknowledgment.".into());
                         }
+                        let history = activity.borrow().history.clone();
+                        history.record(HistoryDirection::Sent, peer, content.payload()).await;
                         activity.borrow_mut().sessions.acknowledge(job, Delivery::Delivered);
                     }
                     SessionEvent::PeerError { id, code } => {
@@ -502,12 +518,14 @@ async fn run_channel(
 
 async fn start_transfer(session: &mut lan::TcpSession<'_>, job: Job) -> Result<Pending, String> {
     match job.content {
-        Content::Text(text) => {
-            let id = session.send_text(&text).await.map_err(lan_error)?;
+        Content::Text(payload) => {
+            let text = payload.as_text().expect("inline text payload");
+            let id = session.send_text(text).await.map_err(lan_error)?;
             Ok(Pending::Ack {
                 id,
                 job: job.id,
                 deadline: Instant::now() + ACK_TIMEOUT,
+                content: Content::Text(payload),
             })
         }
         Content::Bulk(batch) => {
@@ -568,10 +586,10 @@ async fn handle_bulk(
             let transfer = incoming.take().ok_or("Unexpected bulk end.")?;
             let deadline = transfer.deadline().min(Instant::now() + PROGRESS_TIMEOUT);
             match timeout_at(deadline, transfer.finish(id)).await {
-                Ok(Ok(payload)) => {
+                Ok(Ok((payload, _slot))) => {
                     // Image validation yields to the worker. Recheck the lease before publishing.
                     session.ensure_active().map_err(lan_error)?;
-                    publish(activity, session.peer_key(), payload);
+                    publish(activity, session.peer_key(), payload).await;
                     session.acknowledge(id).await.map_err(lan_error)?;
                     Ok(())
                 }
@@ -586,12 +604,19 @@ async fn handle_bulk(
     }
 }
 
-fn publish(activity: &Shared, peer: NoiseKey, payload: Payload) {
-    let mut state = activity.borrow_mut();
-    if let Some(text) = payload.as_text() {
-        state.clipboard.received(text);
-    }
-    state.inbox.push(peer, payload);
+async fn publish(activity: &Shared, peer: NoiseKey, payload: Payload) {
+    let payload = Arc::new(payload);
+    let history = {
+        let mut state = activity.borrow_mut();
+        if let Some(text) = payload.as_text() {
+            state.clipboard.received(text);
+        }
+        state.inbox.push(peer, Arc::clone(&payload));
+        state.history.clone()
+    };
+    history
+        .record(HistoryDirection::Received, peer, &payload)
+        .await;
 }
 
 fn failure_message(code: PeerFailure) -> &'static str {

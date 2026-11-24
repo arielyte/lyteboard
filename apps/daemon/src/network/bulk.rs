@@ -22,7 +22,7 @@ pub(super) struct Inbox {
 }
 
 impl Inbox {
-    pub fn push(&mut self, peer: NoiseKey, payload: Payload) {
+    pub fn push(&mut self, peer: NoiseKey, payload: Arc<Payload>) {
         let size = payload.bytes().len();
         while self.entries.len() == INBOX_LIMIT || self.bytes + size > INBOX_BYTES {
             let (_, old) = self
@@ -32,7 +32,7 @@ impl Inbox {
             self.bytes -= old.bytes().len();
         }
         self.bytes += size;
-        self.entries.push_front((peer, Arc::new(payload)));
+        self.entries.push_front((peer, payload));
     }
 
     pub fn payload(&self, offset: usize) -> Option<Arc<Payload>> {
@@ -60,7 +60,7 @@ impl Inbox {
 }
 
 pub(super) struct Batch {
-    pub payload: Payload,
+    pub payload: Arc<Payload>,
     pub _slot: OwnedSemaphorePermit,
 }
 
@@ -92,8 +92,8 @@ impl Incoming {
         Ok(next)
     }
 
-    pub async fn finish(self, id: TransferId) -> Result<Payload, Error> {
-        self.receiver.finish(id).await
+    pub async fn finish(self, id: TransferId) -> Result<(Payload, OwnedSemaphorePermit), Error> {
+        Ok((self.receiver.finish(id).await?, self._slot))
     }
 }
 
@@ -123,6 +123,10 @@ impl Outgoing {
 
     pub fn manifest(&self) -> Manifest {
         self.batch.payload.manifest(self.id)
+    }
+
+    pub fn into_batch(self) -> Arc<Batch> {
+        self.batch
     }
 
     pub fn deadline(&self) -> Instant {

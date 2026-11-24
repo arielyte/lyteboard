@@ -340,7 +340,11 @@ impl TrustFile {
     }
 }
 
-fn open_private_dir(path: &Path) -> Result<File, StorageError> {
+/// Open or create a private absolute directory without following symlinks.
+pub fn open_private_dir(path: &Path) -> Result<File, StorageError> {
+    if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+        return Err(StorageError::UnsafePath);
+    }
     let uid = geteuid().as_raw();
     let mut dir = File::open("/")?;
     for part in path.components().skip(1) {
@@ -374,7 +378,8 @@ fn open_private_dir(path: &Path) -> Result<File, StorageError> {
     Ok(dir)
 }
 
-fn lock_named(dir: &File, name: &str) -> Result<File, StorageError> {
+/// Exclusively lock a private file inside a previously checked directory.
+pub fn lock_named(dir: &File, name: &str) -> Result<File, StorageError> {
     let lock = File::from(openat(dir, name, LOCK_FLAGS, PRIVATE_FILE)?);
     check_private_file(&lock)?;
     match lock.try_lock() {
@@ -384,7 +389,8 @@ fn lock_named(dir: &File, name: &str) -> Result<File, StorageError> {
     }
 }
 
-fn check_private_file(file: &File) -> Result<(), StorageError> {
+/// Require a private regular file owned by the current effective user.
+pub fn check_private_file(file: &File) -> Result<(), StorageError> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != geteuid().as_raw()

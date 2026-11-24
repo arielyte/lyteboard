@@ -113,7 +113,20 @@ impl Client {
         offset: usize,
     ) -> Result<Option<(lyteboard_protocol::peer::Media, zeroize::Zeroizing<Vec<u8>>)>, ClientError>
     {
-        linux::download(&self.endpoint, offset).await
+        linux::download(&self.endpoint, network::Command::BulkDownload { offset }).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn download_history(
+        &self,
+        id: i64,
+    ) -> Result<Option<(lyteboard_protocol::peer::Media, zeroize::Zeroizing<Vec<u8>>)>, ClientError>
+    {
+        linux::download(
+            &self.endpoint,
+            network::Command::History(network::HistoryCommand::Restore { id }),
+        )
+        .await
     }
 
     async fn request(&self, request: Request) -> Result<Response, ClientError> {

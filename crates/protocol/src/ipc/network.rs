@@ -9,6 +9,7 @@ use crate::peer::{Media, NoiseKey};
 pub const MAX_TEST_TEXT_BYTES: usize = 512;
 pub const DEVICES_PER_PAGE: usize = 4;
 pub const MAX_RECIPIENTS: usize = 32;
+pub const HISTORY_PER_PAGE: usize = 16;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -68,6 +69,7 @@ pub enum Command {
     SetClipboardAuto {
         enabled: bool,
     },
+    History(HistoryCommand),
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +106,48 @@ pub enum Reply {
         enabled: bool,
         last_error: Option<String>,
     },
+    HistoryStatus(Option<HistoryLimits>),
+    HistoryPage {
+        entries: Vec<HistoryEntry>,
+        more: bool,
+    },
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryCommand {
+    Status,
+    List { before: Option<i64> },
+    Restore { id: i64 },
+    Resend { id: i64, peers: Vec<String> },
+    Delete { id: i64 },
+    Clear,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryLimits {
+    pub entries: u32,
+    pub mib: u32,
+    pub days: u32,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub timestamp: i64,
+    pub media: Media,
+    pub direction: HistoryDirection,
+    pub peer: String,
+    pub size: u32,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryDirection {
+    Sent,
+    Received,
 }
 
 impl fmt::Debug for Command {
@@ -254,5 +298,32 @@ mod tests {
             format!("{qr:?} {code:?}"),
             "Network(NetworkCommand([redacted])) Network(NetworkReply([redacted]))"
         );
+    }
+
+    #[test]
+    fn history_metadata_and_max_recipient_request_fit_control_frames() {
+        let page = Response::Network(Reply::HistoryPage {
+            entries: (0..HISTORY_PER_PAGE)
+                .map(|_| HistoryEntry {
+                    id: i64::MAX,
+                    timestamp: i64::MAX,
+                    media: Media::Text,
+                    direction: HistoryDirection::Received,
+                    peer: "ff".repeat(32),
+                    size: u32::MAX,
+                })
+                .collect(),
+            more: true,
+        });
+        let resend = Request::Network(Command::History(HistoryCommand::Resend {
+            peers: vec!["ff".repeat(32); MAX_RECIPIENTS],
+            id: i64::MAX,
+        }));
+        let encoded = encode(&page).unwrap();
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
+        assert_eq!(decode::<Response>(&encoded).unwrap(), page);
+        let encoded = encode(&resend).unwrap();
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
+        assert_eq!(decode::<Request>(&encoded).unwrap(), resend);
     }
 }

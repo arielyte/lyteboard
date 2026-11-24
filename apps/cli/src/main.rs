@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
 mod clipboard;
 #[cfg(target_os = "linux")]
+mod history;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod network;
@@ -63,6 +65,12 @@ enum Command {
     Clipboard {
         #[command(subcommand)]
         command: clipboard::ClipboardCommand,
+    },
+    /// Inspect or reuse opt-in local clipboard history.
+    #[cfg(target_os = "linux")]
+    History {
+        #[command(subcommand)]
+        command: history::HistoryCommand,
     },
     /// Show recent received test messages.
     #[cfg(target_os = "linux")]
