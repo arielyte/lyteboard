@@ -21,3 +21,5 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { workspace = true, features = ["time"] }
+hex = "0.4"
+zeroize = "1"

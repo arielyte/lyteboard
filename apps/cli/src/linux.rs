@@ -17,6 +17,10 @@ const START_RETRY: Duration = Duration::from_millis(30);
 
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("{0}")]
+    Network(String),
+    #[error("terminal I/O failed: {0}")]
+    Terminal(#[source] io::Error),
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error("could not find the lyteboard executable: {0}")]
@@ -64,6 +68,7 @@ pub async fn run(command: Command) -> Result<(), CommandError> {
             client.shutdown().await?;
             println!("Daemon stopped");
         }
+        command => super::network::run(&client, command).await?,
     }
     Ok(())
 }

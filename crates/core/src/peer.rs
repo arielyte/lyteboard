@@ -18,7 +18,7 @@ use std::{
 
 use lyteboard_protocol::peer::{
     ChannelId, Context, FrameKind, InviteId, NoiseKey, Origin, Path, RouteId, RoutedFrame,
-    WireError, lan_prologue, validate_lan_address,
+    WireError, lan_prologue, validate_label, validate_lan_address,
 };
 use thiserror::Error;
 
@@ -141,6 +141,11 @@ impl Endpoint {
     pub fn remember_address(&self, peer: NoiseKey, address: SocketAddr) -> Result<(), Error> {
         validate_lan_address(address)?;
         self.state()?.trust.remember_address(peer, address)
+    }
+
+    pub fn rename_device(&self, peer: NoiseKey, name: String) -> Result<(), Error> {
+        validate_label(&name)?;
+        self.state()?.trust.rename(&peer, name)
     }
 
     /// Release expired pairing and handshake reservations. Admission also runs this sweep.

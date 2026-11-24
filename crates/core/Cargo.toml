@@ -21,7 +21,7 @@ zeroize = "1.8"
 tokio = { workspace = true, features = ["io-util", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true, features = ["fs", "time"] }
+rustix = { workspace = true, features = ["fs", "net", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 secret-service = { version = "6.0.0", default-features = false, features = ["rt-default", "crypto-rust"] }

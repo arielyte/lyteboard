@@ -4,16 +4,19 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use thiserror::Error;
 
+pub mod network;
+
 pub const VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 4096;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Request {
     Ping,
     GetStatus,
     GetVersion,
     Shutdown,
+    Network(network::Command),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +31,7 @@ pub enum Response {
     Status(Status),
     Version(String),
     ShuttingDown,
+    Network(network::Reply),
     Error(ErrorCode),
 }
 

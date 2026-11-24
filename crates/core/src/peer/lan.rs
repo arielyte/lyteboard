@@ -7,8 +7,8 @@ use std::{
 };
 
 use lyteboard_protocol::peer::{
-    FrameKind, LanInvite, MAX_ENVELOPE_BYTES, NoiseKey, Path, QrCode, RoutedFrame, WireError,
-    validate_lan_address,
+    FrameKind, LanInvite, MAX_ENVELOPE_BYTES, NoiseKey, Path, PeerFailure, QrCode, RoutedFrame,
+    WireError, validate_lan_address,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -68,12 +68,29 @@ impl Listener {
         endpoint: &'a Endpoint,
         label: &str,
     ) -> Result<Incoming<'a>, Error> {
+        self.accept_socket()
+            .await?
+            .authenticate(endpoint, label)
+            .await
+    }
+
+    /// Accept a TCP socket before authenticating it. Callers must bound concurrent handshakes.
+    pub async fn accept_socket(&self) -> Result<IncomingSocket, Error> {
         let (stream, _) = self.0.accept().await?;
+        Ok(IncomingSocket(stream))
+    }
+}
+
+pub struct IncomingSocket(TcpStream);
+
+impl IncomingSocket {
+    pub async fn authenticate<'a>(
+        self,
+        endpoint: &'a Endpoint,
+        label: &str,
+    ) -> Result<Incoming<'a>, Error> {
         timeout(HANDSHAKE_TIMEOUT, async {
-            let mut link = Link {
-                stream,
-                local: endpoint.noise_key(),
-            };
+            let mut link = Link::new(self.0, endpoint.noise_key())?;
             let (peer, first) = link.read(FRAME_TIMEOUT).await?;
             match first.kind {
                 FrameKind::PairingOpen => {
@@ -94,7 +111,7 @@ impl Listener {
                         endpoint.accept_session(peer, Path::DirectTcp, first, now()?)?;
                     link.write(&reply).await?;
                     send_ready(&mut link, &mut session).await?;
-                    Ok(Incoming::Session(TcpSession::new(link, session)))
+                    Ok(Incoming::Session(TcpSession::new(link, session, peer)))
                 }
                 _ => Err(Error::Unexpected),
             }
@@ -140,7 +157,7 @@ pub async fn connect_session(
             return Err(Error::Unexpected);
         }
         endpoint.remember_address(peer, address)?;
-        Ok(TcpSession::new(link, session))
+        Ok(TcpSession::new(link, session, peer))
     })
     .await?
 }
@@ -182,6 +199,20 @@ impl<'a> PendingPair<'a> {
         self.peer
     }
 
+    pub fn approval_window(&self) -> Result<Duration, Error> {
+        Ok(self.pairing.approval_window(now()?)?)
+    }
+
+    /// Wait for peer input without consuming it while the local user compares codes.
+    pub async fn wait_for_input(&self) -> Result<(), Error> {
+        self.link.wait_for_input().await
+    }
+
+    /// Handle an early peer approval or rejection without approving locally.
+    pub async fn receive_before_approval(&mut self) -> Result<(), Error> {
+        self.advance(FRAME_TIMEOUT).await
+    }
+
     /// Call after explicit local approval and comparison with the other device's displayed code.
     pub async fn approve(mut self, compared_code: &str) -> Result<PairingStatus, Error> {
         let wait = self.pairing.approval_window(now()?)?;
@@ -215,11 +246,32 @@ impl<'a> PendingPair<'a> {
 }
 
 /// A mutually confirmed ordered channel. Failed or canceled I/O drops its socket and Noise state.
-pub struct TcpSession<'a>(Option<(Link, Session<'a>)>);
+pub struct TcpSession<'a> {
+    channel: Option<(Link, Session<'a>)>,
+    peer: NoiseKey,
+}
 
 impl<'a> TcpSession<'a> {
-    fn new(link: Link, session: Session<'a>) -> Self {
-        Self(Some((link, session)))
+    fn new(link: Link, session: Session<'a>, peer: NoiseKey) -> Self {
+        Self {
+            channel: Some((link, session)),
+            peer,
+        }
+    }
+
+    pub fn peer_key(&self) -> NoiseKey {
+        self.peer
+    }
+
+    /// Await input without consuming it, so this wait can be canceled to send or close.
+    pub async fn wait_for_input(&self) -> Result<(), Error> {
+        let (link, _) = self.channel.as_ref().ok_or(Error::Closed)?;
+        link.wait_for_input().await
+    }
+
+    pub async fn reject_text(&mut self, id: [u8; 16], reason: PeerFailure) -> Result<(), Error> {
+        self.send(|session, now| session.peer_error(Some(id), reason, now))
+            .await
     }
 
     pub async fn send_text(&mut self, text: &str) -> Result<[u8; 16], Error> {
@@ -241,24 +293,24 @@ impl<'a> TcpSession<'a> {
     ) -> Result<(), Error> {
         // Keep both halves outside self while awaiting I/O so cancellation cannot reuse a
         // partially written frame or a Noise nonce.
-        let (mut link, mut session) = self.0.take().ok_or(Error::Closed)?;
+        let (mut link, mut session) = self.channel.take().ok_or(Error::Closed)?;
         link.write(&encrypt(&mut session, now()?)?).await?;
-        self.0 = Some((link, session));
+        self.channel = Some((link, session));
         Ok(())
     }
 
     pub async fn receive(&mut self) -> Result<SessionEvent, Error> {
-        let (mut link, mut session) = self.0.take().ok_or(Error::Closed)?;
+        let (mut link, mut session) = self.channel.take().ok_or(Error::Closed)?;
         let (from, frame) = link.read(FRAME_TIMEOUT).await?;
         let event = session.receive(from, frame, now()?)?;
         if !matches!(event, SessionEvent::Closed) {
-            self.0 = Some((link, session));
+            self.channel = Some((link, session));
         }
         Ok(event)
     }
 
     pub async fn close(mut self) -> Result<(), Error> {
-        let (mut link, mut session) = self.0.take().ok_or(Error::Closed)?;
+        let (mut link, mut session) = self.channel.take().ok_or(Error::Closed)?;
         link.write(&session.close(now()?)?).await
     }
 }
@@ -269,12 +321,32 @@ struct Link {
 }
 
 impl Link {
+    fn new(stream: TcpStream, local: NoiseKey) -> Result<Self, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::net::sockopt;
+            let configure = || -> io::Result<()> {
+                sockopt::set_tcp_keepidle(&stream, Duration::from_secs(10))?;
+                sockopt::set_tcp_keepintvl(&stream, Duration::from_secs(3))?;
+                sockopt::set_tcp_keepcnt(&stream, 3)?;
+                sockopt::set_socket_keepalive(&stream, true)?;
+                Ok(())
+            };
+            configure()?;
+        }
+        Ok(Self { stream, local })
+    }
+
+    async fn wait_for_input(&self) -> Result<(), Error> {
+        if self.stream.peek(&mut [0]).await? == 0 {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
     async fn connect(endpoint: &Endpoint, address: SocketAddr) -> Result<Self, Error> {
         let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await??;
-        Ok(Self {
-            stream,
-            local: endpoint.noise_key(),
-        })
+        Self::new(stream, endpoint.noise_key())
     }
 
     async fn read(&mut self, wait: Duration) -> Result<(NoiseKey, RoutedFrame), Error> {

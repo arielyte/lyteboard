@@ -3,6 +3,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 #[cfg(target_os = "linux")]
+mod network;
+#[cfg(target_os = "linux")]
 mod server;
 
 #[derive(Parser)]

@@ -2,8 +2,8 @@
 
 use std::io;
 
-pub use lyteboard_protocol::ipc::Status;
 use lyteboard_protocol::ipc::{DecodeError, ErrorCode, Request, Response};
+pub use lyteboard_protocol::ipc::{Status, network};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -83,6 +83,13 @@ impl Client {
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         match self.request(Request::Shutdown).await? {
             Response::ShuttingDown => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    pub async fn network(&self, command: network::Command) -> Result<network::Reply, ClientError> {
+        match self.request(Request::Network(command)).await? {
+            Response::Network(reply) => Ok(reply),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

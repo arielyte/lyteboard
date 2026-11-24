@@ -42,6 +42,7 @@ impl Runtime {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lyteboardd"));
         command.env("XDG_RUNTIME_DIR", self.0.path());
+        command.env("LYTEBOARD_PROFILE", self.0.path().join("profile"));
         command
     }
 

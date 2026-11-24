@@ -6,7 +6,7 @@ On Linux, one per-user daemon owns service state. The CLI and the native Rust si
 
 On Android, the Kotlin app owns the platform lifecycle and clipboard adapter. It will call the same Rust core in-process through a small UniFFI surface. Its foreground clipboard actions follow Android's focus rules. See [Platform constraints](platforms.md).
 
-Paired devices will communicate over direct Noise-encrypted TCP on the local network. QR invitations will advertise a reachable listener. mDNS discovery and manual IP fallback are later additions. The diagram shows the intended data paths.
+Paired devices will communicate over direct Noise-encrypted TCP on the local network. QR invitations will advertise a reachable listener. LAN-3 uses mDNS and saved IP and port hints to reconnect paired devices. The diagram shows the intended data paths.
 
 ```mermaid
 flowchart LR
@@ -32,7 +32,7 @@ flowchart LR
 | Storage | Linux profiles keep trust metadata in a private versioned snapshot and identity seeds in Secret Service. Optional history storage and daemon ownership are planned. |
 | User interfaces (`apps/`) | CLI and GUI present status and request operations from the daemon. Kotlin presents Android actions and passes input through the FFI boundary. |
 
-Phase 2B implements in-process pairing and confirmed sessions. LAN-1 runs those state machines over direct TCP in the Rust core with in-memory trust. The daemon will own peer networking on desktop. The standalone CLI and Tauri frontend use the daemon instead of opening their own peer connections. Kotlin uses a small, typed UniFFI interface to the Rust core. Peer transport limits and trust decisions stay in Rust. [Security design](security.md), [Wire protocol](protocol.md)
+Phase 2B implements in-process pairing and confirmed sessions. LAN-1 runs those state machines over direct TCP in the Rust core with in-memory trust. LAN-2B gives the Linux daemon ownership of the listener, persistent trust, and sessions. The CLI controls peer operations through authenticated local IPC. The Tauri frontend uses IPC for daemon status. Kotlin uses a small, typed UniFFI interface to the Rust core. Peer transport limits and trust decisions stay in Rust. [Security design](security.md), [Wire protocol](protocol.md)
 
 ## Trust and privacy
 
@@ -54,5 +54,6 @@ Prefer event-driven clipboard notifications where supported, idle waits, and bou
 | **LAN-0 · Baseline** | Keep Phase 1 and 1.5 application behavior and the verified Phase 2B in-memory protocol. Remove the old service and unfinished application wiring. |
 | **LAN-1 · Direct TCP** | Two independent Rust endpoints pair from a QR carrying a reachable LAN address, establish fresh pinned KK sessions, and exchange acknowledged text. Exercise wrong pins, expired and reused invitations, and malformed frames. |
 | **LAN-2A · Durable identity and trust** | Store credentials in Linux Secret Service. Reload active pins, dial hints, and revocations from a private profile. Verify a fresh authenticated session after reopening it. |
-| **Later · Daemon integration** | Load the durable profile from the daemon, reconnect to the saved address, and expose manual text sharing through CLI and GUI. |
-| **Later · Clipboard and discovery** | Add bounded image streaming, private local history, and clipboard adapters. Add mDNS and manual IP fallback after the direct path works. |
+| **LAN-2B · Daemon and CLI** | Load the durable profile in the daemon. Expose pairing, trust management, and acknowledged test text through local CLI commands. Verify independent daemon processes over TCP. |
+| **LAN-3 · Discovery and reconnection** | Browse and advertise on the local network, accept manual on-link address hints, and reconnect to active pins with bounded backoff. Verify Noise authentication, duplicate handling, and withdrawal on shutdown. |
+| **Later · Clipboard** | Add bounded image streaming, private local history, and clipboard adapters. |

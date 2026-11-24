@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod network;
 
 #[derive(Parser)]
 #[command(name = "lyteboard", version = lyteboard_core::VERSION, about = "Lyteboard command line")]
@@ -24,6 +26,37 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Inspect or configure direct LAN networking.
+    #[cfg(target_os = "linux")]
+    Network {
+        #[command(subcommand)]
+        command: network::NetworkCommand,
+    },
+    /// Pair with another device.
+    #[cfg(target_os = "linux")]
+    Pair {
+        #[command(subcommand)]
+        command: network::PairCommand,
+    },
+    /// Manage paired devices.
+    #[cfg(target_os = "linux")]
+    Devices {
+        #[command(subcommand)]
+        command: network::DeviceCommand,
+    },
+    /// Send short test text and wait for an authenticated receipt.
+    #[cfg(target_os = "linux")]
+    Send {
+        #[arg(value_parser = network::parse_key)]
+        device: [u8; 32],
+        text: String,
+    },
+    /// Show recent received test messages.
+    #[cfg(target_os = "linux")]
+    Received {
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=16))]
+        limit: u8,
     },
 }
 

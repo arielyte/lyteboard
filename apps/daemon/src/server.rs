@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use lyteboard_core::ipc::linux::{
@@ -19,10 +19,14 @@ use tokio::{
     time::timeout,
 };
 
+use crate::network::Network;
+
 const MAX_CLIENTS: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    #[error("could not start the LAN worker: {0}")]
+    Network(#[source] io::Error),
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
     #[error("could not register signal handlers: {0}")]
@@ -37,6 +41,7 @@ pub async fn run() -> Result<(), DaemonError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(DaemonError::Signals)?;
     let endpoint = Endpoint::from_env()?;
     let server = ServerSocket::bind(&endpoint).await?;
+    let (network, network_done) = Network::start().map_err(DaemonError::Network)?;
     let started = Instant::now();
     let connections_accepted = Arc::new(AtomicU64::new(0));
     let mut handlers = JoinSet::new();
@@ -63,13 +68,15 @@ pub async fn run() -> Result<(), DaemonError> {
 
                 if authenticate(&stream).is_ok() {
                     connections_accepted.fetch_add(1, Ordering::Relaxed);
-                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted)));
+                    handlers.spawn(handle(stream, started, Arc::clone(&connections_accepted), network.clone()));
                 }
             }
         }
     };
 
     handlers.shutdown().await;
+    drop(network);
+    let _ = timeout(Duration::from_millis(500), network_done).await;
     drop(server);
     if let Some(mut stream) = shutdown_client {
         // Acknowledgement means the listener and its socket path are already gone.
@@ -83,6 +90,7 @@ async fn handle(
     mut stream: UnixStream,
     started: Instant,
     connections_accepted: Arc<AtomicU64>,
+    network: Network,
 ) -> Option<UnixStream> {
     let response = match timeout(REQUEST_TIMEOUT, receive::<Request>(&mut stream)).await {
         Ok(Ok(Request::Ping)) => Response::Pong,
@@ -96,6 +104,7 @@ async fn handle(
         }),
         Ok(Ok(Request::GetVersion)) => Response::Version(lyteboard_core::VERSION.to_owned()),
         Ok(Ok(Request::Shutdown)) => return Some(stream),
+        Ok(Ok(Request::Network(command))) => Response::Network(network.request(command).await),
         Ok(Err(FrameError::Length(0) | FrameError::Decode(DecodeError::Invalid(_)))) => {
             Response::Error(ErrorCode::InvalidRequest)
         }

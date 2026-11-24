@@ -122,17 +122,26 @@ impl Registry {
         peer: NoiseKey,
         address: SocketAddr,
     ) -> Result<(), Error> {
-        let index = self
-            .records
-            .iter()
-            .position(|(device, status)| {
-                device.noise_key == peer && device.route == peer && *status == Status::Active
-            })
-            .ok_or(Error::Untrusted)?;
+        let index = self.active_index(&peer)?;
+        if self.records[index].0.noise_key != peer {
+            return Err(Error::Untrusted);
+        }
         if self.records[index].0.last_known_address == Some(address) {
             return Ok(());
         }
         self.commit(|records| records[index].0.last_known_address = Some(address))
+    }
+
+    pub(super) fn rename(&mut self, peer: &NoiseKey, name: String) -> Result<(), Error> {
+        let index = self.active_index(peer)?;
+        self.commit(|records| records[index].0.label = name)
+    }
+
+    fn active_index(&self, peer: &NoiseKey) -> Result<usize, Error> {
+        self.records
+            .iter()
+            .position(|(device, status)| &device.route == peer && *status == Status::Active)
+            .ok_or(Error::Untrusted)
     }
 
     fn committed_index(&self, route: &RouteId) -> Result<usize, Error> {
