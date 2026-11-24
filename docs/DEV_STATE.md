@@ -90,6 +90,69 @@ cargo test --locked --workspace
 
 The history harness passed using three daemon profiles, real restarts, Unix IPC, Noise, and TCP with simulated clipboard adapters. It verified opt-in behavior, text and image restoration, multi-recipient metadata, resend and revocation, deletion and clearing, pagination, and transfers with an unavailable history database. The Rust tests passed for count, byte and age retention, permissions, corrupt storage, and the 4 KiB control-frame contract. All 78 workspace tests passed, along with the existing simulated clipboard and LAN CLI harnesses, focused Clippy with warnings denied, formatting, and `git diff --check`.
 
+## LAN-4D checkpoint
+
+Linux clipboard sending is manual by default. `clipboard sync` enables automatic sending of new clipboard text and static PNG, JPEG, or WebP to selected trusted devices. `clipboard auto` independently controls automatic application of received text and images. Both settings and the recipient list reset when the daemon restarts. Stopping the sender preserves its selections until restart. Removing the last recipient stops monitoring.
+
+Wayland monitoring uses `ext-data-control` or `wlr-data-control` through `wl-clipboard-rs`. Current KDE Plasma supports background monitoring through KWin. Lyteboard reads the specific offer that generated the event and skips the initial selection. X11 uses XFixes `CLIPBOARD` owner events through `x11rb` and uses `xclip` to read and write selections. Both backends block for events with no periodic clipboard reads. Manual clipboard commands still use `wl-clipboard` 2.3+ on Wayland and `xclip` on X11. If monitoring is unavailable, the daemon and the manual clipboard commands remain usable wherever the manual adapter has access. [Wayland watcher](https://docs.rs/wl-clipboard-rs/0.9.5/wl_clipboard_rs/watch/struct.Watcher.html), [XFixes selection notifications](https://docs.rs/x11rb/0.14.0/x11rb/protocol/xfixes/trait.ConnectionExt.html)
+
+The sender coalesces bursts with a 200 ms quiet period, ignores repeated content, and skips recent Lyteboard clipboard writes using a bounded fingerprint cache. Receive-side application, `clipboard copy`, and `history restore` suppress echoes. A recipient must have had a confirmed Noise session when the change was observed. Busy and offline peers miss that update, and expired updates are dropped. Reconnection never triggers a clipboard read or a resend. Transfers already in progress can finish when automatic sending is turned off. Revocation closes the affected session. Existing bulk limits, encryption, acknowledgments, and optional history still apply. IPC control frames remain limited to 4 KiB.
+
+Offers advertising the KDE `x-kde-passwordManagerHint` target are skipped for automatic sending, including Wayland selections created with `wl-copy --sensitive`. **Password detection is not guaranteed.** Some applications and bridges omit the hint. Automatic sending should be turned off if the session is used to copy unmarked secrets. X11 reports selection-owner events, so a clipboard owner that mutates content without publishing another selection can go undetected. The bounded echo cache can temporarily suppress a deliberate recopy of the same content. Automatic sending is best-effort and can omit rapidly replaced content. Native Xorg remains unverified.
+
+### Automatic clipboard demonstration
+
+Start both daemons inside their graphical sessions and pair them. Enable automatic application on the receiver and then copy a test value on the sender.
+
+```bash
+# Receiver
+lyteboard clipboard auto on
+
+# Sender
+lyteboard devices list
+read -r -p 'Paired recipient ID: ' peer_id
+lyteboard clipboard sync add "$peer_id"
+lyteboard clipboard sync on
+lyteboard clipboard sync status
+printf 'Automatic clipboard test ✓' | wl-copy --type 'text/plain;charset=utf-8'
+```
+
+On the receiver, compare the copied text. Then send the image from the sender and compare its hash on each device.
+
+```bash
+# Receiver
+wl-paste --no-newline --type text | cmp - <(printf 'Automatic clipboard test ✓')
+
+# Sender
+wl-copy --type image/png < sample.png
+sha256sum sample.png
+
+# Receiver
+wl-paste --no-newline --type image/png | sha256sum
+
+# Sender controls
+lyteboard clipboard sync off
+lyteboard clipboard sync remove "$peer_id"
+
+# Receiver control
+lyteboard clipboard auto off
+```
+
+On X11, seed the test value with `printf 'Automatic clipboard test ✓' | xclip -selection clipboard -in -target UTF8_STRING -silent` and the image with `xclip -selection clipboard -in -target image/png -silent < sample.png`. Read it back with `xclip -selection clipboard -out -target image/png | sha256sum`. To demonstrate filtering on Wayland, seed a disposable value with `printf 'Sensitive test' | wl-copy --sensitive` while automatic sending is enabled.
+
+```sh
+cargo build --locked -p lyteboard-daemon -p lyteboard-cli
+cargo test --locked -p lyteboard-core --lib clipboard::
+cargo test --locked -p lyteboard-daemon --bin lyteboardd network::sync::
+cargo test --locked -p lyteboard-protocol network_payloads_fit_existing_frames_and_debug_is_redacted
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_sync_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_sync_cli.py --x11
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_sync_cli.py --simulated
+cargo test --locked --workspace
+```
+
+The graphical harness passed with three real nested KWin Wayland sessions and with two devices switched to real nested Xwayland selections. These tests exercised live change notifications, text and PNG transfers, three-device echo prevention, repeat suppression, sensitive Wayland offers, offline and revoked peers, daemon restart, and display loss. They used synthetic clipboard data in isolated sessions. The simulated mode verified manual fallback with fake clipboard utilities when monitoring could not start. All 81 workspace tests passed, along with the existing simulated clipboard and history harnesses, focused Clippy with warnings denied, formatting, and `git diff --check`.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -282,4 +345,4 @@ cargo test --locked --workspace
 
 ## Remaining work
 
-Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic writes cannot reach the display. Continuous clipboard monitoring and GUI peer controls remain pending.
+Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails. GUI peer and synchronization controls remain pending.

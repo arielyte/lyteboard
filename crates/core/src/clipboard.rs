@@ -1,4 +1,6 @@
-//! Linux clipboard access through the desktop's text utilities.
+//! Linux clipboard access and change notifications.
+
+pub mod monitor;
 
 use std::{env, ffi::OsStr, io, process::Stdio, time::Duration};
 
@@ -36,6 +38,8 @@ pub enum Error {
     NoSupportedContent,
     #[error("Clipboard text must be UTF-8 without NUL bytes.")]
     InvalidText,
+    #[error("Clipboard monitoring is unavailable. {0}")]
+    Monitor(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -58,9 +62,27 @@ impl Clipboard {
     }
 
     pub async fn read_content(self) -> Result<(Media, Zeroizing<Vec<u8>>), Error> {
-        let (tool, args) = self.0.targets();
-        let targets = self.read_bytes(tool, args, TARGETS_LIMIT).await?;
+        self.read_selection(false)
+            .await?
+            .ok_or(Error::NoSupportedContent)
+    }
+
+    async fn read_selection(
+        self,
+        unattended: bool,
+    ) -> Result<Option<(Media, Zeroizing<Vec<u8>>)>, Error> {
+        let (targets_tool, targets_args) = self.0.targets();
+        let targets = self
+            .read_bytes(targets_tool, targets_args, TARGETS_LIMIT)
+            .await?;
         let targets = std::str::from_utf8(&targets).map_err(|_| self.0.access())?;
+        if unattended
+            && targets
+                .lines()
+                .any(|target| monitor::is_sensitive(target.trim()))
+        {
+            return Ok(None);
+        }
         let media = select_media(targets).ok_or(Error::NoSupportedContent)?;
         let (tool, args) = self.0.reader(media);
         let bytes = self.read_bytes(tool, &args, media.limit()).await?;
@@ -70,7 +92,15 @@ impl Clipboard {
         } else if bytes.is_empty() {
             return Err(Error::NoSupportedContent);
         }
-        Ok((media, bytes))
+        if unattended {
+            let current = self
+                .read_bytes(targets_tool, targets_args, TARGETS_LIMIT)
+                .await?;
+            if current.as_slice() != targets.as_bytes() {
+                return Ok(None);
+            }
+        }
+        Ok(Some((media, bytes)))
     }
 
     async fn read_bytes(

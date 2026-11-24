@@ -60,7 +60,7 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
-    /// Send or apply text from the Linux clipboard.
+    /// Share or apply Linux clipboard text and images.
     #[cfg(target_os = "linux")]
     Clipboard {
         #[command(subcommand)]

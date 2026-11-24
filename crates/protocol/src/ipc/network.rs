@@ -69,6 +69,7 @@ pub enum Command {
     SetClipboardAuto {
         enabled: bool,
     },
+    ClipboardSync(ClipboardSyncCommand),
     History(HistoryCommand),
 }
 
@@ -106,11 +107,24 @@ pub enum Reply {
         enabled: bool,
         last_error: Option<String>,
     },
+    ClipboardSync {
+        enabled: bool,
+        peers: Vec<String>,
+        last_error: Option<String>,
+    },
     HistoryStatus(Option<HistoryLimits>),
     HistoryPage {
         entries: Vec<HistoryEntry>,
         more: bool,
     },
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClipboardSyncCommand {
+    Status,
+    Set { enabled: bool },
+    Recipient { peer: NoiseKey, enabled: bool },
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -276,6 +290,14 @@ mod tests {
         let auto_frame = encode(&auto).unwrap();
         assert!(auto_frame.len() < MAX_FRAME_BYTES);
         assert_eq!(decode::<Request>(&auto_frame).unwrap(), auto);
+        let sync = Response::Network(Reply::ClipboardSync {
+            enabled: true,
+            peers: vec!["ff".repeat(32); MAX_RECIPIENTS],
+            last_error: Some("Clipboard monitoring is unavailable.".into()),
+        });
+        let sync_frame = encode(&sync).unwrap();
+        assert!(sync_frame.len() <= MAX_FRAME_BYTES);
+        assert_eq!(decode::<Response>(&sync_frame).unwrap(), sync);
         let upload = Request::Network(Command::BulkUpload {
             peers: vec!["ff".repeat(32); MAX_RECIPIENTS],
             media: Media::Webp,

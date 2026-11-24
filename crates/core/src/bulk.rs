@@ -109,6 +109,10 @@ impl Payload {
         }
     }
 
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
     pub fn media(&self) -> Media {
         self.media
     }

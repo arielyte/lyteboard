@@ -4,6 +4,7 @@ mod bulk;
 mod clipboard;
 mod discovery;
 mod sessions;
+mod sync;
 
 use std::{
     cell::RefCell, env, io, net::SocketAddr, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
@@ -14,11 +15,14 @@ use lyteboard_core::peer::{
     lan::{self, Incoming, Listener, PendingPair},
     storage::{StorageError, open_endpoint},
 };
-use lyteboard_core::{bulk::Payload, clipboard::Clipboard};
+use lyteboard_core::{
+    bulk::Payload,
+    clipboard::{Clipboard, monitor::Monitor},
+};
 use lyteboard_protocol::{
     ipc::network::{
-        Command, DEVICES_PER_PAGE, Device, Discovered, DiscoveryState, PairStatus, QueueOutcome,
-        Reply,
+        ClipboardSyncCommand, Command, DEVICES_PER_PAGE, Device, Discovered, DiscoveryState,
+        PairStatus, QueueOutcome, Reply,
     },
     peer::{MAX_LABEL_BYTES, NoiseKey, validate_label},
 };
@@ -33,12 +37,15 @@ use zeroize::Zeroizing;
 use crate::history::History;
 
 use bulk::{Batch, Inbox};
-use clipboard::AutoClipboard;
+use clipboard::{AutoClipboard, ClipboardWrites};
 use discovery::{Discovery, Hints, LocalNetworks};
 use sessions::Sessions;
 
 #[derive(Clone)]
-pub struct Network(mpsc::Sender<(Operation, oneshot::Sender<Output>)>);
+pub struct Network {
+    requests: mpsc::Sender<(Operation, oneshot::Sender<Output>)>,
+    clipboard_writes: ClipboardWrites,
+}
 
 enum Operation {
     Control(Command),
@@ -58,16 +65,28 @@ impl Network {
     ) -> io::Result<(Self, oneshot::Receiver<()>)> {
         let (tx, rx) = mpsc::channel(32);
         let (finished, done) = oneshot::channel();
+        let clipboard_writes = ClipboardWrites::default();
+        let writes = clipboard_writes.clone();
         let runtime = runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         std::thread::Builder::new()
             .name("lyteboard-lan".into())
             .spawn(move || {
-                LocalSet::new().block_on(&runtime, Worker::new(profile, history).run(rx));
+                LocalSet::new().block_on(&runtime, Worker::new(profile, history, writes).run(rx));
                 let _ = finished.send(());
             })?;
-        Ok((Self(tx), done))
+        Ok((
+            Self {
+                requests: tx,
+                clipboard_writes,
+            },
+            done,
+        ))
+    }
+
+    pub fn mark_clipboard_write(&self, payload: &Payload) {
+        self.clipboard_writes.remember(payload);
     }
 
     pub async fn request(&self, command: Command) -> Reply {
@@ -100,7 +119,7 @@ impl Network {
 
     async fn dispatch(&self, operation: Operation) -> Result<Output, String> {
         let (tx, rx) = oneshot::channel();
-        if self.0.try_send((operation, tx)).is_err() {
+        if self.requests.try_send((operation, tx)).is_err() {
             return Err("LAN worker is unavailable or busy".into());
         }
         match timeout(Duration::from_secs(2), rx).await {
@@ -131,6 +150,8 @@ struct Activity {
     incoming_bulk: Arc<Semaphore>,
     outgoing_bulk: Arc<Semaphore>,
     clipboard: AutoClipboard,
+    clipboard_writes: ClipboardWrites,
+    sync: sync::Sync,
     history: History,
 }
 
@@ -157,7 +178,7 @@ pub(super) fn profile_path() -> Option<PathBuf> {
 }
 
 impl Worker {
-    fn new(profile: Option<PathBuf>, history: History) -> Self {
+    fn new(profile: Option<PathBuf>, history: History, clipboard_writes: ClipboardWrites) -> Self {
         let name = env::var("LYTEBOARD_DEVICE_NAME").unwrap_or_else(|_| "Lyteboard".into());
         let label = if name.trim().is_empty() || validate_label(&name).is_err() {
             Err(format!(
@@ -184,6 +205,8 @@ impl Worker {
                 incoming_bulk: Arc::new(Semaphore::new(2)),
                 outgoing_bulk: Arc::new(Semaphore::new(2)),
                 clipboard: AutoClipboard::default(),
+                clipboard_writes,
+                sync: sync::Sync::default(),
                 history,
             })),
         }
@@ -321,17 +344,7 @@ impl Worker {
 
     async fn upload(&mut self, peers: Vec<NoiseKey>, payload: Payload) -> Result<Reply, String> {
         let endpoint = self.ensure_ready().await?;
-        let slot = self
-            .activity
-            .borrow()
-            .outgoing_bulk
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "Bulk sending is busy. Retry after the current transfers.")?;
-        let batch = Arc::new(Batch {
-            payload: Arc::new(payload),
-            _slot: slot,
-        });
+        let batch = self.activity.borrow().bulk_batch(payload)?;
         let outcomes = peers
             .into_iter()
             .map(|peer| {
@@ -361,6 +374,52 @@ impl Worker {
         Ok(Reply::BulkQueued(outcomes))
     }
 
+    async fn clipboard_sync(&mut self, command: ClipboardSyncCommand) -> Result<Reply, String> {
+        match command {
+            ClipboardSyncCommand::Status => (),
+            ClipboardSyncCommand::Set { enabled: false } => {
+                self.activity.borrow_mut().sync.disable()
+            }
+            ClipboardSyncCommand::Set { enabled: true } => {
+                if !self.activity.borrow().sync.is_enabled() {
+                    if !self.activity.borrow().sync.has_recipients() {
+                        return Err(
+                            "Select a paired device with clipboard sync add DEVICE first.".into(),
+                        );
+                    }
+                    let clipboard = Clipboard::for_session().map_err(|error| error.to_string())?;
+                    let monitor = Monitor::start(clipboard)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    self.activity
+                        .borrow_mut()
+                        .sync
+                        .enable(&self.activity, monitor);
+                }
+            }
+            ClipboardSyncCommand::Recipient {
+                peer,
+                enabled: false,
+            } => self.activity.borrow_mut().sync.remove(peer),
+            ClipboardSyncCommand::Recipient {
+                peer,
+                enabled: true,
+            } => {
+                let endpoint = self.ensure_ready().await?;
+                if !endpoint
+                    .trusted_devices()
+                    .map_err(peer_error)?
+                    .iter()
+                    .any(|device| device.noise_key == peer)
+                {
+                    return Err("Device is not trusted.".into());
+                }
+                self.activity.borrow_mut().sync.set_recipient(peer)?;
+            }
+        }
+        Ok(self.activity.borrow().sync.status())
+    }
+
     async fn command(&mut self, command: Command) -> Result<Reply, String> {
         if let Command::Listen { address } = command {
             let endpoint = self.ensure_endpoint()?;
@@ -368,6 +427,7 @@ impl Worker {
             return self.status();
         }
         match command {
+            Command::ClipboardSync(command) => return self.clipboard_sync(command).await,
             Command::ClipboardAutoStatus => return Ok(self.activity.borrow().clipboard.status()),
             Command::SetClipboardAuto { enabled: false } => {
                 self.activity.borrow_mut().clipboard.disable();
@@ -382,7 +442,9 @@ impl Worker {
                         .check_writer()
                         .await
                         .map_err(|error| error.to_string())?;
-                    self.activity.borrow_mut().clipboard.enable(clipboard);
+                    let mut activity = self.activity.borrow_mut();
+                    let writes = activity.clipboard_writes.clone();
+                    activity.clipboard.enable(clipboard, writes);
                 }
                 return Ok(self.activity.borrow().clipboard.status());
             }
@@ -392,6 +454,7 @@ impl Worker {
         match command {
             Command::Listen { .. }
             | Command::ClipboardAutoStatus
+            | Command::ClipboardSync(_)
             | Command::SetClipboardAuto { .. } => unreachable!(),
             Command::Status => self.status(),
             Command::SetDiscovery { enabled } => {
@@ -506,7 +569,9 @@ impl Worker {
             }
             Command::Remove { peer } => {
                 endpoint.revoke(peer).map_err(peer_error)?;
-                self.activity.borrow_mut().sessions.remove_peer(peer);
+                let mut state = self.activity.borrow_mut();
+                state.sessions.remove_peer(peer);
+                state.sync.remove(peer);
                 Ok(Reply::Ok)
             }
             Command::Send { peer, text } => {
@@ -551,6 +616,18 @@ impl Worker {
 }
 
 impl Activity {
+    fn bulk_batch(&self, payload: Payload) -> Result<Arc<Batch>, String> {
+        let slot = self
+            .outgoing_bulk
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Bulk sending is busy. Retry after the current transfers.")?;
+        Ok(Arc::new(Batch {
+            payload: Arc::new(payload),
+            _slot: slot,
+        }))
+    }
+
     fn begin_pair(&mut self) -> Result<(u64, oneshot::Receiver<()>), String> {
         if self.pair.is_some() {
             return Err("A pairing is already in progress.".into());

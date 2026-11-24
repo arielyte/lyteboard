@@ -5,7 +5,9 @@ use lyteboard_core::{
     clipboard::Clipboard,
     ipc::{
         Client,
-        network::{Command as Request, Delivery, MAX_RECIPIENTS, QueueOutcome, Reply},
+        network::{
+            ClipboardSyncCommand, Command as Request, Delivery, MAX_RECIPIENTS, QueueOutcome, Reply,
+        },
     },
 };
 use tokio::time::{Instant, sleep, timeout_at};
@@ -27,10 +29,35 @@ pub enum ClipboardCommand {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=16))]
         index: u8,
     },
-    /// Check or change automatic application of newly received text.
+    /// Check or change automatic application of newly received text and images.
     Auto {
         #[arg(value_enum, default_value = "status")]
         mode: AutoMode,
+    },
+    /// Configure automatic sending of new local clipboard content.
+    Sync {
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SyncCommand {
+    /// Show automatic sending and its selected devices.
+    Status,
+    /// Start sending future clipboard changes to selected online devices.
+    On,
+    /// Stop sending clipboard changes.
+    Off,
+    /// Select a trusted device for automatic sending.
+    Add {
+        #[arg(value_parser = parse_key)]
+        device: [u8; 32],
+    },
+    /// Deselect a device for automatic sending.
+    Remove {
+        #[arg(value_parser = parse_key)]
+        device: [u8; 32],
     },
 }
 
@@ -66,6 +93,9 @@ pub async fn run(client: &Client, command: ClipboardCommand) -> Result<(), Comma
             );
             Ok(())
         }
+        ClipboardCommand::Sync { command } => {
+            sync(client, command.unwrap_or(SyncCommand::Status)).await
+        }
         ClipboardCommand::Auto { mode } => {
             let reply = request(
                 client,
@@ -93,6 +123,41 @@ pub async fn run(client: &Client, command: ClipboardCommand) -> Result<(), Comma
             Ok(())
         }
     }
+}
+
+async fn sync(client: &Client, command: SyncCommand) -> Result<(), CommandError> {
+    let command = match command {
+        SyncCommand::Status => ClipboardSyncCommand::Status,
+        SyncCommand::On => ClipboardSyncCommand::Set { enabled: true },
+        SyncCommand::Off => ClipboardSyncCommand::Set { enabled: false },
+        SyncCommand::Add { device } => ClipboardSyncCommand::Recipient {
+            peer: device,
+            enabled: true,
+        },
+        SyncCommand::Remove { device } => ClipboardSyncCommand::Recipient {
+            peer: device,
+            enabled: false,
+        },
+    };
+    let Reply::ClipboardSync {
+        enabled,
+        peers,
+        last_error,
+    } = request(client, Request::ClipboardSync(command)).await?
+    else {
+        return Err(unexpected());
+    };
+    println!(
+        "Automatic clipboard sending {}",
+        if enabled { "on" } else { "off" }
+    );
+    for peer in peers {
+        println!("{peer}");
+    }
+    if let Some(error) = last_error {
+        eprintln!("{error}");
+    }
+    Ok(())
 }
 
 pub fn selection(mut peers: Vec<[u8; 32]>) -> Result<Vec<[u8; 32]>, CommandError> {

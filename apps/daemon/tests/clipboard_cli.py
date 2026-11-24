@@ -124,6 +124,7 @@ time.sleep(3600)
         with (home / "kwin.log").open("wb") as log:
             process = subprocess.Popen(command, env=compositor_env, stdout=log,
                                        stderr=log, start_new_session=True)
+        self.process = process
         cleanup.callback(stop_kwin, process)
         wait_for(socket.is_socket)
         device.env.update(XDG_SESSION_TYPE="wayland", WAYLAND_DISPLAY=str(socket))
@@ -144,9 +145,12 @@ time.sleep(3600)
             raise AssertionError("reading the isolated graphical selection failed")
         return result.stdout
 
-    def seed(self, data, mime="text/plain;charset=utf-8"):
+    def seed(self, data, mime="text/plain;charset=utf-8", *, sensitive=True):
         if not self.x11:
-            subprocess.run(["wl-copy", "--type", mime, "--sensitive"], env=self.env,
+            command = ["wl-copy", "--type", mime]
+            if sensitive:
+                command.append("--sensitive")
+            subprocess.run(command, env=self.env,
                            input=data, check=True, timeout=3,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return

@@ -18,6 +18,7 @@ use super::{
     Activity, Shared,
     bulk::{Batch, Incoming, Outgoing, PROGRESS_TIMEOUT},
     lan_error, peer_error,
+    sync::Automatic,
 };
 
 const DELIVERY_LIMIT: usize = 64;
@@ -39,7 +40,7 @@ struct Channel {
     id: u64,
     jobs: mpsc::Sender<Job>,
     _cancel_on_drop: oneshot::Sender<()>,
-    ready: bool,
+    ready: Option<Instant>,
 }
 
 struct Mailbox {
@@ -51,6 +52,7 @@ struct Mailbox {
 struct Job {
     id: u64,
     content: Content,
+    automatic: Option<Automatic>,
 }
 
 enum Content {
@@ -131,7 +133,7 @@ impl Sessions {
     pub(super) fn connected(&self) -> usize {
         self.channels
             .values()
-            .filter(|channel| channel.ready)
+            .filter(|channel| channel.ready.is_some())
             .count()
     }
 
@@ -141,7 +143,7 @@ impl Sessions {
         if inbound
             .iter()
             .chain(outbound.iter())
-            .any(|channel| channel.ready)
+            .any(|channel| channel.ready.is_some())
         {
             ConnectionState::Online
         } else if inbound.is_some() || outbound.is_some() {
@@ -155,7 +157,7 @@ impl Sessions {
         if self
             .channels
             .get(&(peer, true))
-            .is_some_and(|channel| !channel.ready)
+            .is_some_and(|channel| channel.ready.is_none())
         {
             let channel = self.channels.remove(&(peer, true)).unwrap();
             self.finish_pending(channel.id, "Peer address changed during connection.");
@@ -167,12 +169,12 @@ impl Sessions {
         let Some(channel) = self.channels.get_mut(&key) else {
             return false;
         };
-        channel.ready = true;
+        channel.ready = Some(Instant::now());
         self.retry.remove(&key.0);
         if self
             .channels
             .get(&(key.0, !key.1))
-            .is_some_and(|other| other.ready)
+            .is_some_and(|other| other.ready.is_some())
         {
             // Both peers choose the same socket independently. Keep the one initiated
             // by the lower public key once both confirmed paths exist.
@@ -200,7 +202,7 @@ impl Sessions {
         }
     }
 
-    fn register(&mut self, key: ChannelKey, ready: bool) -> Mailbox {
+    fn register(&mut self, key: ChannelKey) -> Mailbox {
         let id = self.id();
         let (send, jobs) = mpsc::channel(4);
         let (cancel, canceled) = oneshot::channel();
@@ -210,10 +212,59 @@ impl Sessions {
                 id,
                 jobs: send,
                 _cancel_on_drop: cancel,
-                ready,
+                ready: None,
             },
         );
         Mailbox { id, jobs, canceled }
+    }
+
+    pub(super) fn queue_automatic(
+        &mut self,
+        peer: NoiseKey,
+        batch: Arc<Batch>,
+        automatic: Automatic,
+    ) {
+        let _ = self.enqueue(peer, Content::Bulk(batch), Some(automatic));
+    }
+
+    fn enqueue(
+        &mut self,
+        peer: NoiseKey,
+        content: Content,
+        automatic: Option<Automatic>,
+    ) -> Result<u64, String> {
+        let channel = self
+            .channels
+            .get(&(peer, false))
+            .filter(|channel| channel.ready.is_some())
+            .or_else(|| self.channels.get(&(peer, true)))
+            .ok_or("Peer connection is unavailable.")?;
+        let channel_id = channel.id;
+        if let Some(automatic) = &automatic
+            && (!automatic.is_current()
+                || channel.ready.is_none_or(|ready| ready > automatic.observed)
+                || self.deliveries.values().any(|transfer| {
+                    transfer.channel == channel_id && matches!(transfer.status, Delivery::Pending)
+                }))
+        {
+            return Err("Peer was offline or busy when the clipboard changed.".into());
+        }
+        let jobs = channel.jobs.clone();
+        let id = self.delivery_slot()?;
+        jobs.try_send(Job {
+            id,
+            content,
+            automatic,
+        })
+        .map_err(|_| "Peer connection is busy or closed.")?;
+        self.deliveries.insert(
+            id,
+            Transfer {
+                channel: channel_id,
+                status: Delivery::Pending,
+            },
+        );
+        Ok(id)
     }
 
     fn id(&mut self) -> u64 {
@@ -308,29 +359,7 @@ fn queue(
     if activity.borrow().sessions.state(peer) == ConnectionState::Offline {
         start_dial(activity, endpoint, &device)?;
     }
-    let mut state = activity.borrow_mut();
-    let sessions = &mut state.sessions;
-    let id = sessions.delivery_slot()?;
-    let inbound = (peer, false);
-    let outbound = (peer, true);
-    let channel = sessions
-        .channels
-        .get(&inbound)
-        .filter(|channel| channel.ready)
-        .or_else(|| sessions.channels.get(&outbound))
-        .expect("an existing channel was found or a dial was registered");
-    channel
-        .jobs
-        .try_send(Job { id, content })
-        .map_err(|_| "Peer connection is busy or closed.")?;
-    sessions.deliveries.insert(
-        id,
-        Transfer {
-            channel: channel.id,
-            status: Delivery::Pending,
-        },
-    );
-    Ok(id)
+    activity.borrow_mut().sessions.enqueue(peer, content, None)
 }
 
 pub(super) fn reconnect(activity: &Shared, endpoint: &Rc<Endpoint>) {
@@ -366,7 +395,7 @@ fn start_dial(
     if sessions
         .channels
         .values()
-        .filter(|channel| !channel.ready)
+        .filter(|channel| channel.ready.is_none())
         .count()
         >= MAX_DIALING
     {
@@ -398,7 +427,7 @@ fn start_dial(
         id,
         jobs,
         mut canceled,
-    } = sessions.register(key, false);
+    } = sessions.register(key);
     let activity = Rc::clone(activity);
     spawn_local(async move {
         let result = tokio::select! {
@@ -421,7 +450,7 @@ pub(super) async fn incoming(activity: &Shared, session: lan::TcpSession<'_>, lo
     let key = (session.peer_key(), false);
     let Mailbox { id, jobs, canceled } = {
         let mut state = activity.borrow_mut();
-        let mailbox = state.sessions.register(key, true);
+        let mailbox = state.sessions.register(key);
         state.sessions.mark_ready(key, local);
         mailbox
     };
@@ -458,7 +487,11 @@ async fn run_channel(
             _ = sleep_until(deadline) => return Err("Transfer or session timed out.".into()),
             job = jobs.recv(), if pending.is_none() => {
                 let Some(job) = job else { return Ok(()) };
-                pending = Some(start_transfer(&mut session, job).await?);
+                if job.automatic.as_ref().is_some_and(|automatic| !automatic.is_current()) {
+                    activity.borrow_mut().sessions.acknowledge(job.id, Delivery::Failed("Automatic clipboard update expired.".into()));
+                } else {
+                    pending = Some(start_transfer(&mut session, job).await?);
+                }
             }
             readable = session.wait_for_input() => {
                 readable.map_err(lan_error)?;
@@ -608,9 +641,7 @@ async fn publish(activity: &Shared, peer: NoiseKey, payload: Payload) {
     let payload = Arc::new(payload);
     let history = {
         let mut state = activity.borrow_mut();
-        if let Some(text) = payload.as_text() {
-            state.clipboard.received(text);
-        }
+        state.clipboard.received(&payload);
         state.inbox.push(peer, Arc::clone(&payload));
         state.history.clone()
     };
@@ -667,10 +698,10 @@ mod tests {
             let peer = if local == [1; 32] { [2; 32] } else { [1; 32] };
             for first in [false, true] {
                 let mut sessions = Sessions::default();
-                let mut one = sessions.register((peer, first), false);
+                let mut one = sessions.register((peer, first));
                 assert_eq!(sessions.state(peer), ConnectionState::Connecting);
                 assert!(sessions.mark_ready((peer, first), local));
-                let mut two = sessions.register((peer, !first), false);
+                let mut two = sessions.register((peer, !first));
                 sessions.mark_ready((peer, !first), local);
                 assert_eq!(sessions.connected(), 1);
                 let outbound = local < peer;

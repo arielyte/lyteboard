@@ -151,13 +151,16 @@ async fn handle(
                     _ => unreachable!(),
                 };
                 let (reply, item) = match result {
-                    Ok(Some(item)) => (
-                        Reply::BulkItem {
-                            media: item.media(),
-                            size: item.bytes().len() as u32,
-                        },
-                        Some(item),
-                    ),
+                    Ok(Some(item)) => {
+                        network.mark_clipboard_write(&item);
+                        (
+                            Reply::BulkItem {
+                                media: item.media(),
+                                size: item.bytes().len() as u32,
+                            },
+                            Some(item),
+                        )
+                    }
                     Ok(None) => (Reply::NoBulkItem, None),
                     Err(error) => (Reply::Error(error), None),
                 };
