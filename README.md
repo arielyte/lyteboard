@@ -1,8 +1,8 @@
 # Lyteboard
 
-Lyteboard is an open-source project for sharing text and images between Linux, Windows, and Android devices. The design defaults to manual sharing with remembered QR pairing and end-to-end encryption. It calls for direct LAN transfers when available, an encrypted relay fallback, and no accounts, ads, tracking, or telemetry.
+Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Linux is the first target, with Windows and a Kotlin Android companion planned.
 
-Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared by the CLI and the desktop window. Clipboard capture, pairing, synchronization, history, and WebSocket forwarding are upcoming milestones.
+Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared by the CLI and the desktop window. The shared Rust core has in-process pairing and encrypted sessions. Direct TCP, clipboard integration, automatic reconnection, and local history are planned. [Development state](docs/DEV_STATE.md)
 
 ## Repository layout
 
@@ -11,9 +11,8 @@ Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared 
 | `apps/desktop/` | React and Vite frontend with a Tauri Rust shell in `src-tauri/` |
 | `apps/cli/` | `lyteboard` command-line entry point |
 | `apps/daemon/` | `lyteboardd` Linux daemon |
-| `crates/core/` | Shared daemon client and Linux socket transport |
+| `crates/core/` | Shared Linux daemon client, device pairing, and encrypted peer sessions |
 | `crates/protocol/` | Versioned IPC and peer protocol boundary |
-| `services/relay/` | Independent Axum relay process |
 | `contrib/systemd/` | Optional systemd user unit |
 | `docs/` | Architecture, platform requirements, and tooling decisions |
 
@@ -30,7 +29,7 @@ cargo build --locked
 ./target/debug/lyteboard daemon stop
 ```
 
-Run `./target/debug/lyteboardd` for foreground operation. See the [Linux daemon guide](docs/daemon.md) for CLI and GUI verification, the IPC trust boundary, and optional systemd installation. To run the independent relay health scaffold, use `cargo run --locked -p lyteboard-relay` and check `http://127.0.0.1:8787/healthz`.
+Run `./target/debug/lyteboardd` for foreground operation. See the [Linux daemon guide](docs/daemon.md) for CLI and GUI verification, the IPC trust boundary, and optional systemd installation.
 
 With the desktop dependencies installed:
 

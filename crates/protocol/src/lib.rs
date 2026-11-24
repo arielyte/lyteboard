@@ -1,3 +1,4 @@
-//! Versioned local IPC definitions. A future peer protocol will be independent.
+//! Versioned local IPC and independent peer wire definitions.
 
 pub mod ipc;
+pub mod peer;

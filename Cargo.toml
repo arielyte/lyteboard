@@ -5,14 +5,12 @@ members = [
     "apps/desktop/src-tauri",
     "crates/core",
     "crates/protocol",
-    "services/relay",
 ]
 default-members = [
     "apps/cli",
     "apps/daemon",
     "crates/core",
     "crates/protocol",
-    "services/relay",
 ]
 resolver = "3"
 
@@ -25,7 +23,6 @@ repository = "https://github.com/arielyte/lyteboard"
 publish = false
 
 [workspace.dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6", features = ["derive"] }
 lyteboard-core = { path = "crates/core" }
 lyteboard-protocol = { path = "crates/protocol" }
