@@ -29,7 +29,7 @@ flowchart LR
 | Networking | Open one ordered TCP stream per peer session. Bound connection admission, frame lengths, and deadlines. |
 | Synchronization (`crates/core`) | Explicit selection of recipients, opt-in automatic capture, reconnect backoff, duplicate suppression, and clipboard loop prevention. |
 | Clipboard adapters | Linux X11 and Wayland, Windows, and Android provide platform-specific clipboard operations. Capabilities can differ between sessions. |
-| Storage | One local database per endpoint for trust metadata and optional history. Keep private keys in OS credential storage. The desktop daemon owns local persistence. |
+| Storage | Linux profiles keep trust metadata in a private versioned snapshot and identity seeds in Secret Service. Optional history storage and daemon ownership are planned. |
 | User interfaces (`apps/`) | CLI and GUI present status and request operations from the daemon. Kotlin presents Android actions and passes input through the FFI boundary. |
 
 Phase 2B implements in-process pairing and confirmed sessions. LAN-1 runs those state machines over direct TCP in the Rust core with in-memory trust. The daemon will own peer networking on desktop. The standalone CLI and Tauri frontend use the daemon instead of opening their own peer connections. Kotlin uses a small, typed UniFFI interface to the Rust core. Peer transport limits and trust decisions stay in Rust. [Security design](security.md), [Wire protocol](protocol.md)
@@ -53,5 +53,6 @@ Prefer event-driven clipboard notifications where supported, idle waits, and bou
 | --- | --- |
 | **LAN-0 · Baseline** | Keep Phase 1 and 1.5 application behavior and the verified Phase 2B in-memory protocol. Remove the old service and unfinished application wiring. |
 | **LAN-1 · Direct TCP** | Two independent Rust endpoints pair from a QR carrying a reachable LAN address, establish fresh pinned KK sessions, and exchange acknowledged text. Exercise wrong pins, expired and reused invitations, and malformed frames. |
-| **LAN-2 · Daemon and durable trust** | Use OS-protected credentials and persistent active and revoked pins. Restart and reconnect to the saved address, fail closed on unavailable credentials, and verify revocation. Expose manual text sharing through CLI and GUI. |
+| **LAN-2A · Durable identity and trust** | Store credentials in Linux Secret Service. Reload active pins, dial hints, and revocations from a private profile. Verify a fresh authenticated session after reopening it. |
+| **Later · Daemon integration** | Load the durable profile from the daemon, reconnect to the saved address, and expose manual text sharing through CLI and GUI. |
 | **Later · Clipboard and discovery** | Add bounded image streaming, private local history, and clipboard adapters. Add mDNS and manual IP fallback after the direct path works. |

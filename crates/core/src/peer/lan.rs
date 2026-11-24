@@ -8,6 +8,7 @@ use std::{
 
 use lyteboard_protocol::peer::{
     FrameKind, LanInvite, MAX_ENVELOPE_BYTES, NoiseKey, Path, QrCode, RoutedFrame, WireError,
+    validate_lan_address,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -128,6 +129,7 @@ pub async fn connect_session(
     address: SocketAddr,
     peer: NoiseKey,
 ) -> Result<TcpSession<'_>, Error> {
+    validate_lan_address(address)?;
     timeout(HANDSHAKE_TIMEOUT, async {
         let (mut session, first) = endpoint.begin_session(peer, Path::DirectTcp, now()?)?;
         let mut link = Link::connect(endpoint, address).await?;
@@ -137,6 +139,7 @@ pub async fn connect_session(
         if !matches!(session.receive(from, frame, now()?)?, SessionEvent::Ready) {
             return Err(Error::Unexpected);
         }
+        endpoint.remember_address(peer, address)?;
         Ok(TcpSession::new(link, session))
     })
     .await?

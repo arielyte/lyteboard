@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use cbor::Reader;
 pub use frame::{FrameKind, RoutedFrame};
-pub use invite::{Invite, LanInvite, QrCode};
+pub use invite::{Invite, LanInvite, QrCode, validate_lan_address};
 
 pub type RouteId = [u8; 32];
 pub type NoiseKey = [u8; 32];

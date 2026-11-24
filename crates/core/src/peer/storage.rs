@@ -1,16 +1,16 @@
-//! Unwired Linux profile draft retained for future persistence work.
+//! Linux peer profiles and Secret Service credentials.
 //! Key material is stored in the user's Secret Service.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, TryLockError},
     io::{self, Read, Write},
+    net::SocketAddr,
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
-use lyteboard_protocol::peer::RouteId;
+use lyteboard_protocol::peer::{NoiseKey, RouteId, validate_label, validate_lan_address};
 use rustix::{
     fs::{AtFlags, Mode, OFlags, mkdirat, openat, renameat, unlinkat},
     io::Errno,
@@ -19,12 +19,19 @@ use rustix::{
 use secret_service::{EncryptionType, blocking::SecretService};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
-use super::{CredentialError, CredentialStore, Credentials, DeviceIdentity};
+use super::{
+    CredentialError, CredentialStore, Credentials, DeviceIdentity, Endpoint, State, TrustedDevice,
+    trust::{MAX_ACTIVE, MAX_RECORDS, Registry, Status},
+};
 
 const VERSION: u16 = 1;
 const IDENTITY_LIMIT: usize = 512;
+const TRUST_LIMIT: usize = 128 * 1024;
+const IDENTITY_FILE: &str = "identity.json";
+const TRUST_FILE: &str = "trusted-devices.json";
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 const LOCK_FLAGS: OFlags = OFlags::RDWR
     .union(OFlags::CREATE)
@@ -48,6 +55,10 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("the stored profile format is invalid")]
     Invalid,
+    #[error("the trusted-device file is missing from an existing profile")]
+    MissingTrust,
+    #[error("profile sync failed after replacement; reopen the profile before use")]
+    WriteUncertain,
     #[error("the stored profile belongs to another device identity")]
     WrongIdentity,
     #[error(transparent)]
@@ -60,17 +71,22 @@ impl From<Errno> for StorageError {
     }
 }
 
-#[derive(Clone)]
-pub struct Profile(Arc<ProfileInner>);
+/// Open a durable LAN endpoint, creating its identity on first use. Call on a blocking thread.
+pub fn open_endpoint(path: &Path) -> Result<Endpoint, StorageError> {
+    let profile = Profile::open(path)?;
+    let namespace = profile.namespace.clone();
+    profile.load(&mut ServiceStore {
+        namespace: &namespace,
+    })
+}
 
-struct ProfileInner {
+struct Profile {
     dir: File,
     namespace: String,
-    identity_lock: Mutex<()>,
     _lock: File,
 }
 
-#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Owner {
     version: u16,
@@ -89,8 +105,7 @@ impl Owner {
 }
 
 impl Profile {
-    /// Lock one data directory for exclusive use by a daemon.
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
+    fn open(path: &Path) -> Result<Self, StorageError> {
         if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
             return Err(StorageError::UnsafePath);
         }
@@ -98,59 +113,89 @@ impl Profile {
         let namespace = path.to_str().ok_or(StorageError::UnsafePath)?.to_owned();
         let dir = open_private_dir(&path)?;
         let lock = lock_named(&dir, "profile.lock")?;
-        Ok(Self(Arc::new(ProfileInner {
+        Ok(Self {
             dir,
             namespace,
-            identity_lock: Mutex::new(()),
             _lock: lock,
-        })))
-    }
-
-    /// Load or explicitly provision this profile's identity. Call on a blocking thread.
-    pub fn identity(&self) -> Result<DeviceIdentity, StorageError> {
-        let _guard = self
-            .0
-            .identity_lock
-            .lock()
-            .map_err(|_| StorageError::Invalid)?;
-        self.load_identity(&mut ServiceStore {
-            namespace: &self.0.namespace,
         })
     }
 
-    fn load_identity(
-        &self,
-        store: &mut impl CredentialStore,
-    ) -> Result<DeviceIdentity, StorageError> {
-        let anchor = self
-            .read("identity.json", IDENTITY_LIMIT)?
-            .map(|bytes| serde_json::from_slice::<Owner>(&bytes).map_err(|_| StorageError::Invalid))
-            .transpose()?;
+    fn load(self, store: &mut impl CredentialStore) -> Result<Endpoint, StorageError> {
+        let anchor: Option<Owner> = self.read_json(IDENTITY_FILE, IDENTITY_LIMIT)?;
+        let snapshot: Option<TrustSnapshot> = self.read_json(TRUST_FILE, TRUST_LIMIT)?;
+        if anchor
+            .as_ref()
+            .is_some_and(|owner| owner.version != VERSION)
+        {
+            return Err(StorageError::Invalid);
+        }
+        if anchor.is_some() && snapshot.is_none() {
+            return Err(StorageError::MissingTrust);
+        }
         let identity = match store.load()? {
             Some(credentials) => DeviceIdentity::from_credentials(credentials)?,
-            None if anchor.is_some() => return Err(CredentialError::Missing.into()),
+            None if anchor.is_some() || snapshot.is_some() => {
+                return Err(CredentialError::Missing.into());
+            }
             None => {
                 let credentials = Credentials::generate()?;
                 store.store(&credentials)?;
                 DeviceIdentity::from_credentials(credentials)?
             }
         };
-        let actual = Owner::from_identity(&identity);
-        match anchor {
-            Some(anchor) if anchor.version != VERSION => return Err(StorageError::Invalid),
-            Some(anchor) if anchor != actual => return Err(StorageError::WrongIdentity),
-            Some(_) => (),
-            None => self.write(
-                "identity.json",
-                &serde_json::to_vec(&actual).map_err(|_| StorageError::Invalid)?,
-                IDENTITY_LIMIT,
-            )?,
+        let owner = Owner::from_identity(&identity);
+        if anchor.as_ref().is_some_and(|anchor| anchor != &owner) {
+            return Err(StorageError::WrongIdentity);
         }
-        Ok(identity)
+        let file = TrustFile {
+            profile: self,
+            owner,
+        };
+        let records = if let Some(snapshot) = snapshot {
+            snapshot.into_records(&file.owner)?
+        } else {
+            file.save(&[])?;
+            Vec::new()
+        };
+        // Write trust first. A crash here leaves a recoverable snapshot tied to the keyring item.
+        if anchor.is_none() {
+            file.profile
+                .write_json(IDENTITY_FILE, &file.owner, IDENTITY_LIMIT)?;
+        }
+
+        let mut endpoint = Endpoint::new_lan(identity);
+        endpoint.state = std::sync::Mutex::new(State {
+            trust: Registry::persistent(file, records),
+            ..State::default()
+        });
+        Ok(endpoint)
+    }
+
+    fn read_json<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<T>, StorageError> {
+        self.read(name, limit)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| StorageError::Invalid))
+            .transpose()
+    }
+
+    fn write_json(
+        &self,
+        name: &str,
+        value: &impl Serialize,
+        limit: usize,
+    ) -> Result<(), StorageError> {
+        self.write(
+            name,
+            &serde_json::to_vec(value).map_err(|_| StorageError::Invalid)?,
+            limit,
+        )
     }
 
     fn read(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>, StorageError> {
-        let fd = match openat(&self.0.dir, name, READ_FLAGS, Mode::empty()) {
+        let fd = match openat(&self.dir, name, READ_FLAGS, Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -173,7 +218,7 @@ impl Profile {
         getrandom::fill(&mut suffix).map_err(|_| CredentialError::EntropyUnavailable)?;
         let temporary = format!(".{:032x}.tmp", u128::from_ne_bytes(suffix));
         let fd = openat(
-            &self.0.dir,
+            &self.dir,
             temporary.as_str(),
             LOCK_FLAGS | OFlags::EXCL,
             PRIVATE_FILE,
@@ -183,14 +228,115 @@ impl Profile {
             check_private_file(&file)?;
             file.write_all(bytes)?;
             file.sync_all()?;
-            renameat(&self.0.dir, temporary.as_str(), &self.0.dir, name)?;
-            self.0.dir.sync_all()?;
+            renameat(&self.dir, temporary.as_str(), &self.dir, name)?;
+            self.dir
+                .sync_all()
+                .map_err(|_| StorageError::WriteUncertain)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = unlinkat(&self.0.dir, temporary.as_str(), AtFlags::empty());
+            let _ = unlinkat(&self.dir, temporary.as_str(), AtFlags::empty());
         }
         result
+    }
+}
+
+pub(super) struct TrustFile {
+    profile: Profile,
+    owner: Owner,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TrustSnapshot {
+    version: u16,
+    owner: Owner,
+    devices: Vec<StoredDevice>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDevice {
+    noise_key: NoiseKey,
+    label: String,
+    last_known_address: Option<SocketAddr>,
+    revoked: bool,
+}
+
+impl TrustSnapshot {
+    fn into_records(self, owner: &Owner) -> Result<Vec<(TrustedDevice, Status)>, StorageError> {
+        if self.version != VERSION
+            || self.owner.version != VERSION
+            || self.devices.len() > MAX_RECORDS
+            || self.devices.iter().filter(|device| !device.revoked).count() > MAX_ACTIVE
+        {
+            return Err(StorageError::Invalid);
+        }
+        if self.owner != *owner {
+            return Err(StorageError::WrongIdentity);
+        }
+        let mut seen = HashSet::new();
+        // Any fixed clamped scalar detects non-contributory public keys.
+        let validation_scalar = StaticSecret::from([1; 32]);
+        self.devices
+            .into_iter()
+            .map(|device| {
+                if device.noise_key == owner.noise
+                    || !seen.insert(device.noise_key)
+                    || validate_label(&device.label).is_err()
+                    || device
+                        .last_known_address
+                        .is_some_and(|address| validate_lan_address(address).is_err())
+                    || !validation_scalar
+                        .diffie_hellman(&PublicKey::from(device.noise_key))
+                        .was_contributory()
+                {
+                    return Err(StorageError::Invalid);
+                }
+                Ok((
+                    TrustedDevice {
+                        route: device.noise_key,
+                        noise_key: device.noise_key,
+                        label: device.label,
+                        last_known_address: device.last_known_address,
+                    },
+                    if device.revoked {
+                        Status::Revoked
+                    } else {
+                        Status::Active
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+impl TrustFile {
+    pub(super) fn save(&self, records: &[(TrustedDevice, Status)]) -> Result<(), StorageError> {
+        let devices = records
+            .iter()
+            .filter(|(_, status)| !matches!(status, Status::Pending(_)))
+            .map(|(device, status)| {
+                if device.route != device.noise_key {
+                    return Err(StorageError::Invalid);
+                }
+                Ok(StoredDevice {
+                    noise_key: device.noise_key,
+                    label: device.label.clone(),
+                    last_known_address: device.last_known_address,
+                    revoked: *status == Status::Revoked,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.profile.write_json(
+            TRUST_FILE,
+            &TrustSnapshot {
+                version: VERSION,
+                owner: self.owner.clone(),
+                devices,
+            },
+            TRUST_LIMIT,
+        )
     }
 }
 
@@ -211,7 +357,8 @@ fn open_private_dir(path: &Path) -> Result<File, StorageError> {
         let next = match openat(&dir, name, flags, Mode::empty()) {
             Err(Errno::NOENT) => {
                 match mkdirat(&dir, name, Mode::RWXU) {
-                    Ok(()) | Err(Errno::EXIST) => (),
+                    Ok(()) => dir.sync_all()?,
+                    Err(Errno::EXIST) => (),
                     Err(error) => return Err(error.into()),
                 }
                 openat(&dir, name, flags, Mode::empty())?
@@ -277,21 +424,10 @@ impl CredentialStore for ServiceStore<'_> {
             [item] => item,
             _ => return Err(CredentialError::Invalid),
         };
-        let session = service.get_collection_by_alias("session").ok();
-        let item_path = item.item_path.as_str();
-        if [
-            Some("/org/freedesktop/secrets/collection/session"),
-            session.as_ref().map(|entry| entry.collection_path.as_str()),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|prefix| {
-            item_path
-                .strip_prefix(prefix)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        }) {
+        if is_session_path(&service, item.item_path.as_str())? {
             return Err(CredentialError::Invalid);
         }
+        item.ensure_unlocked().map_err(credential_error)?;
         let secret = Zeroizing::new(item.get_secret().map_err(credential_error)?);
         let bytes: &[u8; 64] = secret
             .as_slice()
@@ -316,12 +452,7 @@ impl CredentialStore for ServiceStore<'_> {
             return Err(CredentialError::Invalid);
         }
         let collection = service.get_default_collection().map_err(credential_error)?;
-        let path = collection.collection_path.as_str();
-        if path == "/org/freedesktop/secrets/collection/session"
-            || service
-                .get_collection_by_alias("session")
-                .is_ok_and(|entry| entry.collection_path == collection.collection_path)
-        {
+        if is_session_path(&service, collection.collection_path.as_str())? {
             return Err(CredentialError::Unavailable);
         }
         collection.ensure_unlocked().map_err(credential_error)?;
@@ -343,6 +474,24 @@ impl CredentialStore for ServiceStore<'_> {
     }
 }
 
+fn is_session_path<'a>(
+    service: &'a SecretService<'a>,
+    path: &str,
+) -> Result<bool, CredentialError> {
+    let belongs_to = |collection: &str| {
+        path.strip_prefix(collection)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    };
+    if belongs_to("/org/freedesktop/secrets/collection/session") {
+        return Ok(true);
+    }
+    match service.get_collection_by_alias("session") {
+        Ok(collection) => Ok(belongs_to(collection.collection_path.as_str())),
+        Err(secret_service::Error::NoResult) => Ok(false),
+        Err(error) => Err(credential_error(error)),
+    }
+}
+
 fn credential_error(error: secret_service::Error) -> CredentialError {
     match error {
         secret_service::Error::Locked => CredentialError::Locked,
@@ -350,3 +499,6 @@ fn credential_error(error: secret_service::Error) -> CredentialError {
         _ => CredentialError::Unavailable,
     }
 }
+
+#[cfg(test)]
+mod tests;

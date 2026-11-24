@@ -5,17 +5,20 @@ mod identity;
 pub mod lan;
 mod pairing;
 mod session;
+#[cfg(target_os = "linux")]
+pub mod storage;
 mod trust;
 
 use std::{
     collections::BTreeMap,
+    net::SocketAddr,
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
 use lyteboard_protocol::peer::{
-    ChannelId, Context, FrameKind, InviteId, Origin, Path, RouteId, RoutedFrame, WireError,
-    lan_prologue,
+    ChannelId, Context, FrameKind, InviteId, NoiseKey, Origin, Path, RouteId, RoutedFrame,
+    WireError, lan_prologue, validate_lan_address,
 };
 use thiserror::Error;
 
@@ -38,6 +41,9 @@ pub enum Error {
     Wire(#[from] WireError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Storage(#[from] storage::StorageError),
     #[error("operating system random source unavailable")]
     Random,
     #[error("peer state unavailable")]
@@ -131,6 +137,12 @@ impl Endpoint {
         Ok(self.state()?.trust.active_devices())
     }
 
+    /// Remember a dial hint for an active LAN pin. This does not change trust.
+    pub fn remember_address(&self, peer: NoiseKey, address: SocketAddr) -> Result<(), Error> {
+        validate_lan_address(address)?;
+        self.state()?.trust.remember_address(peer, address)
+    }
+
     /// Release expired pairing and handshake reservations. Admission also runs this sweep.
     pub fn expire_pending(&self, now: Time) -> Result<(), Error> {
         self.state_at(now).map(|_| ())
@@ -153,7 +165,9 @@ impl Endpoint {
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, Error> {
-        self.state.lock().map_err(|_| Error::Unavailable)
+        let state = self.state.lock().map_err(|_| Error::Unavailable)?;
+        state.trust.ensure_available()?;
+        Ok(state)
     }
 
     fn state_at(&self, now: Time) -> Result<MutexGuard<'_, State>, Error> {

@@ -121,17 +121,7 @@ impl LanInvite {
         noise_key: NoiseKey,
         expires_at: u64,
     ) -> Result<Self, WireError> {
-        let ip = address.ip();
-        if address.port() == 0
-            || ip.is_unspecified()
-            || ip.is_multicast()
-            || ip == IpAddr::V4(Ipv4Addr::BROADCAST)
-            || matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0
-                || v6.flowinfo() != 0 || v6.ip().is_unicast_link_local()
-                || v6.ip().to_ipv4_mapped().is_some())
-        {
-            return Err(WireError::Malformed);
-        }
+        validate_lan_address(address)?;
         Ok(Self {
             address,
             id,
@@ -194,6 +184,22 @@ impl LanInvite {
         reader.finish()?;
         Self::new(address, id, psk, noise_key, expires_at)
     }
+}
+
+/// Validate an IP and port that can be represented as a LAN connection hint.
+pub fn validate_lan_address(address: SocketAddr) -> Result<(), WireError> {
+    let ip = address.ip();
+    if address.port() == 0
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip == IpAddr::V4(Ipv4Addr::BROADCAST)
+        || matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0
+                || v6.flowinfo() != 0 || v6.ip().is_unicast_link_local()
+                || v6.ip().to_ipv4_mapped().is_some())
+    {
+        return Err(WireError::Malformed);
+    }
+    Ok(())
 }
 
 fn encode_qr(prefix: &str, bytes: &[u8]) -> QrCode {

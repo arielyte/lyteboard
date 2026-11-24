@@ -36,6 +36,7 @@ impl LocalInvite {
 }
 
 struct PairTarget<'a> {
+    address: Option<SocketAddr>,
     path: Path,
     route: RouteId,
     key: NoiseKey,
@@ -126,6 +127,7 @@ impl Endpoint {
         }
         self.begin_pairing_with(
             PairTarget {
+                address: None,
                 path: Path::Relay,
                 route: invite.route,
                 key: invite.noise_key,
@@ -146,6 +148,7 @@ impl Endpoint {
     ) -> Result<(Pairing<'_>, RoutedFrame), Error> {
         self.begin_pairing_with(
             PairTarget {
+                address: Some(invite.address),
                 path: Path::DirectTcp,
                 route: invite.noise_key,
                 key: invite.noise_key,
@@ -210,6 +213,7 @@ impl Endpoint {
                 }),
                 context,
                 started: now,
+                address: invite.address,
                 scanner_limit: Some((skew_deadline, invite.key)),
                 label: label.into(),
                 phase: Some(Phase::Handshake(handshake)),
@@ -300,6 +304,7 @@ impl Endpoint {
                 }),
                 context,
                 started: now,
+                address: None,
                 scanner_limit: None,
                 label: label.into(),
                 phase: Some(Phase::Handshake(handshake)),
@@ -339,6 +344,7 @@ pub struct Pairing<'a> {
     context: PeerContext,
     started: Time,
     scanner_limit: Option<(u64, [u8; 32])>,
+    address: Option<SocketAddr>,
     label: String,
     phase: Option<Phase>,
     status: PairingStatus,
@@ -350,6 +356,7 @@ enum Phase {
 }
 
 struct Confirmation {
+    address: Option<SocketAddr>,
     transport: Transport,
     hash: Zeroizing<[u8; 32]>,
     noise_key: [u8; 32],
@@ -435,6 +442,7 @@ impl Pairing<'_> {
                 }
                 let hash = Zeroizing::new(hash);
                 let mut confirmation = Confirmation {
+                    address: self.address,
                     code: comparison_code(&hash),
                     hash,
                     noise_key,
@@ -691,6 +699,7 @@ fn stage(
             route: remote_route(context, lease.slot.initiator),
             noise_key: confirmation.noise_key,
             label,
+            last_known_address: confirmation.address,
         },
     )?;
     confirmation.step = next;

@@ -52,6 +52,8 @@ pub enum CredentialError {
     EntropyUnavailable,
     #[error("device credentials have not been provisioned")]
     Missing,
+    #[error("the credential store is locked")]
+    Locked,
     #[error("the credential store is unavailable")]
     Unavailable,
     #[error("the device credentials are invalid")]
