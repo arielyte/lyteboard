@@ -1,6 +1,6 @@
 # Linux daemon and local IPC
 
-The CLI and desktop window read daemon state from the same service. The GUI checks on launch and on each **Refresh status** click. Closing the window leaves the daemon running.
+The CLI and desktop window communicate with the same daemon. The GUI checks status on launch, while focused, and on manual refresh. Closing the window leaves the daemon running.
 
 ## Run without systemd
 
@@ -54,9 +54,9 @@ systemctl --user daemon-reload
 ## Verify the CLI and GUI together
 
 1. Start the GUI with `npm run tauri dev` in `apps/desktop`. It should show **Daemon offline** when the daemon is stopped.
-2. Start the daemon. Run `./target/debug/lyteboard status` from the repository root and click **Refresh status** in the GUI. Both should report the same version and PID. Uptime can differ by elapsed time between requests.
+2. Start the daemon. Run `./target/debug/lyteboard status` from the repository root and click **Refresh** on the GUI’s Settings page. The version and process ID should match.
 3. Run `./target/debug/lyteboard daemon stop`. The next CLI status should exit nonzero and the next GUI refresh should show **Daemon offline**.
-4. Start the daemon again and click **Refresh status**. Both interfaces should report the new process. Close the GUI and run `./target/debug/lyteboard ping` to confirm the daemon is still running.
+4. Start the daemon again and refresh. Both interfaces should report the new process. Close the GUI and run `./target/debug/lyteboard ping` to confirm the daemon is still running.
 
 ## Protocol and trust boundary
 

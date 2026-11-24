@@ -1,19 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use lyteboard_core::ipc::{Client, ClientError, Status};
+mod desktop;
 
-#[tauri::command]
-async fn daemon_status() -> Result<Option<Status>, String> {
-    let client = Client::from_env().map_err(|error| error.to_string())?;
-    match client.status().await {
-        Ok(status) => Ok(Some(status)),
-        Err(ClientError::Offline) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
-}
+use desktop::*;
 
 fn main() -> tauri::Result<()> {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![daemon_status])
+        .invoke_handler(tauri::generate_handler![
+            daemon_status,
+            devices_snapshot,
+            discover_devices,
+            set_listener,
+            set_discovery,
+            rename_device,
+            set_device_address,
+            remove_device,
+            send_clipboard,
+            pair_invite,
+            pair_import,
+            pair_status,
+            pair_confirm,
+            pair_cancel,
+        ])
         .run(tauri::generate_context!())
 }

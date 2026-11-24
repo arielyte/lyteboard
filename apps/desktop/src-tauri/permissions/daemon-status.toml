@@ -1,4 +1,0 @@
-[[permission]]
-identifier = "allow-daemon-status"
-description = "Read the local Lyteboard daemon status."
-commands.allow = ["daemon_status"]

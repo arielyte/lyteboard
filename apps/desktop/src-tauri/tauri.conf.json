@@ -13,10 +13,10 @@
       {
         "label": "main",
         "title": "Lyteboard",
-        "width": 520,
-        "height": 340,
-        "minWidth": 320,
-        "minHeight": 240
+        "width": 760,
+        "height": 540,
+        "minWidth": 420,
+        "minHeight": 360
       }
     ],
     "security": {

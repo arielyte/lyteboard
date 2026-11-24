@@ -153,6 +153,39 @@ cargo test --locked --workspace
 
 The graphical harness passed with three real nested KWin Wayland sessions and with two devices switched to real nested Xwayland selections. These tests exercised live change notifications, text and PNG transfers, three-device echo prevention, repeat suppression, sensitive Wayland offers, offline and revoked peers, daemon restart, and display loss. They used synthetic clipboard data in isolated sessions. The simulated mode verified manual fallback with fake clipboard utilities when monitoring could not start. All 81 workspace tests passed, along with the existing simulated clipboard and history harnesses, focused Clippy with warnings denied, formatting, and `git diff --check`.
 
+## LAN-5A checkpoint
+
+The Linux Tauri window uses the same authenticated Unix IPC client as the CLI. Its Devices view shows the daemon and each peer’s connection state. Users can send the clipboard to one online peer or a selection, with per-peer errors and success based on authenticated delivery acknowledgments. Clipboard bytes remain in Rust. The daemon keeps running when the window closes.
+
+Pair device supports a locally rendered QR, optional invitation text, paste import, and explicit comparison-code confirmation. Invitation data lives in the open pairing dialog and is cleared on expiry, pairing, or dismissal. Avoid sharing the invitation with unintended devices. The GUI does not write it to the clipboard. If copying the revealed text manually, first pause automatic clipboard sending. [Tauri command capabilities](https://v2.tauri.app/security/capabilities/)
+
+Discover shows live mDNS address hints. The GUI can save a discovered address for a paired device, or accept a manual IP and port from Manage. Settings exposes the daemon listener and discovery toggle, alongside System, Light, and Dark appearance. Device removal requires confirmation and revokes trust. Listener and discovery changes follow the daemon’s existing per-process lifetime. The History page points to the CLI. Full history management, image previews, camera-based QR import, automatic synchronization settings, tray support, and startup integration remain pending.
+
+From the repository root on Linux, build and open the window in the graphical session that runs the daemon.
+
+```sh
+cargo build --locked -p lyteboard-daemon -p lyteboard-cli
+npm --prefix apps/desktop run lint
+npm --prefix apps/desktop run format:check
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+cargo test --locked -p lyteboard-desktop -p lyteboard-core -p lyteboard-daemon -p lyteboard-protocol
+target/debug/lyteboard daemon start
+target/release/lyteboard-desktop
+```
+
+For a peer on another computer, enter this device’s on-link IP and port under **Settings → Local network** before generating an invitation. Pair and compare the verification codes on both devices. In Devices, use **Send** beside a peer or select multiple online peers. If the daemon is offline, start it from the same graphical session and refresh.
+
+The native test uses `tauri-driver`, `WebKitWebDriver`, nested KWin, GNOME Keyring, and the built CLI and daemon executables. The optional `zbarimg` tool decodes the displayed QR. With `--lan-ip`, it checks actual on-host multicast discovery on the selected on-link interface. Use `--driver` and `--webkit-driver` for binaries outside `PATH`.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py
+read -r -p 'Local interface IPv4 address: ' lan_ip
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py --lan-ip "$lan_ip"
+```
+
+The locked Tauri release build, TypeScript, lint, formatting, desktop Clippy, and all 81 affected Rust tests passed. The native WebKit window passed against three isolated daemons in KWin Wayland. Verification covered offline recovery, both themes, QR decoding and cancellation, invitation import and comparison, text and PNG sends, transfer errors, actual on-host mDNS, listener and peer address changes, renaming and revocation, and daemon survival after window close. Verification used one Linux host.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -345,4 +378,4 @@ cargo test --locked --workspace
 
 ## Remaining work
 
-Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires `network listen` or a daemon restart with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use `devices address` for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails. GUI peer and synchronization controls remain pending.
+Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires changing the listener or restarting the daemon with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use the paired device’s manual address for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails.

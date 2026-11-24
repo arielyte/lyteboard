@@ -1,6 +1,21 @@
 {
   "identifier": "main",
-  "description": "Daemon status for the local Lyteboard window.",
+  "description": "Device management and clipboard sharing for the local Lyteboard window.",
   "windows": ["main"],
-  "permissions": ["allow-daemon-status"]
+  "permissions": [
+    "allow-daemon-status",
+    "allow-devices-snapshot",
+    "allow-discover-devices",
+    "allow-set-listener",
+    "allow-set-discovery",
+    "allow-rename-device",
+    "allow-set-device-address",
+    "allow-remove-device",
+    "allow-send-clipboard",
+    "allow-pair-invite",
+    "allow-pair-import",
+    "allow-pair-status",
+    "allow-pair-confirm",
+    "allow-pair-cancel"
+  ]
 }

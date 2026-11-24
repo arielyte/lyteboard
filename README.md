@@ -2,7 +2,7 @@
 
 Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Linux is the first target, with Windows and a Kotlin Android companion planned.
 
-Phase 1.5 provides a persistent Linux daemon and authenticated local IPC shared by the CLI and the desktop window. The Linux CLI can pair devices and exchange encrypted clipboard text and images over direct TCP through the daemon. Paired devices reconnect using mDNS or a saved LAN address. Persistent clipboard history is planned. [Development state](docs/DEV_STATE.md)
+The Linux desktop window and CLI use the same daemon to pair devices and share encrypted clipboard text and images. Paired devices reconnect using mDNS or a saved LAN address. The CLI also manages opt-in clipboard history and automatic synchronization. [Development state](docs/DEV_STATE.md)
 
 ## Repository layout
 
@@ -40,7 +40,7 @@ npm ci
 npm run tauri dev
 ```
 
-Run the desktop window through Tauri to access the daemon status command. To build the native binary with the frontend embedded, run `npm run tauri build -- --no-bundle -- --locked` from `apps/desktop`. Cargo emits the release binary in the workspace's `target/release/` directory.
+Start the daemon from the same graphical session, then run the desktop window through Tauri. To build the native binary with the frontend embedded, run `npm run tauri build -- --no-bundle -- --locked` from `apps/desktop`. Cargo emits the release binary in the workspace's `target/release/` directory.
 
 The Android scaffold is deferred until an Android SDK, a supported JDK/Gradle pairing, and device or emulator tooling are available. See [Platform constraints](docs/platforms.md) for the documented configuration, [Contributing](CONTRIBUTING.md) for checks, and [Architecture](docs/architecture.md) for process boundaries.
 
