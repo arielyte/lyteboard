@@ -16,6 +16,7 @@ fn main() {
         "pair_cancel",
         "clipboard_preferences",
         "set_clipboard_sending",
+        "set_clipboard_pause",
         "set_clipboard_application",
         "set_clipboard_recipient",
         "history_configuration",
@@ -26,6 +27,13 @@ fn main() {
         "resend_history",
         "delete_history",
         "clear_history",
+        "desktop_configuration",
+        "set_desktop_preferences",
+        "set_login_startup",
+        "start_daemon",
+        "stop_daemon",
+        "select_tray_recipients",
+        "minimize_to_tray",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("build Lyteboard desktop permissions");

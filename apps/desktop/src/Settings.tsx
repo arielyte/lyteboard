@@ -5,6 +5,7 @@ import {
   errorMessage,
   type Device,
   type ClipboardPreferences,
+  type DesktopConfiguration,
   type HistoryConfiguration,
   type HistoryLimits,
 } from "./api";
@@ -15,11 +16,21 @@ export function Settings({
   setTheme,
   connection,
   changed,
+  daemonBusy,
+  manageDaemon,
+  desktop,
+  setDesktop,
+  revision,
 }: {
   theme: Theme;
   setTheme: (theme: Theme) => void;
   connection: Connection;
   changed: (message: string) => void;
+  daemonBusy: boolean;
+  manageDaemon: (start: boolean) => Promise<void>;
+  desktop: DesktopConfiguration | undefined;
+  setDesktop: (configuration: DesktopConfiguration) => void;
+  revision: number;
 }) {
   const listener =
     connection.state === "connected" ? connection.network?.listener : undefined;
@@ -57,21 +68,53 @@ export function Settings({
           </select>
         </label>
       </section>
+      <section className="setting-group">
+        <h2>Daemon</h2>
+        <div className="setting-line">
+          <span>
+            {connection.state === "connected"
+              ? "Running"
+              : connection.state === "offline"
+                ? "Offline"
+                : connection.state === "checking"
+                  ? "Checking…"
+                  : "Unavailable"}
+          </span>
+          <button
+            type="button"
+            disabled={
+              daemonBusy ||
+              connection.state === "checking" ||
+              connection.state === "error"
+            }
+            onClick={() => void manageDaemon(connection.state !== "connected")}
+          >
+            {daemonBusy
+              ? "Working…"
+              : connection.state === "connected"
+                ? "Stop daemon"
+                : "Start daemon"}
+          </button>
+        </div>
+        {connection.state === "connected" && (
+          <>
+            <div className="setting-line">
+              <span className="muted">Version</span>
+              <span>{connection.daemon.version}</span>
+            </div>
+            <div className="setting-line">
+              <span className="muted">Process ID</span>
+              <span>{connection.daemon.pid}</span>
+            </div>
+          </>
+        )}
+      </section>
+      <DesktopControls configuration={desktop} update={setDesktop} />
       {connection.state === "connected" && (
-        <section className="setting-group">
-          <h2>Daemon</h2>
-          <div className="setting-line">
-            <span className="muted">Version</span>
-            <span>{connection.daemon.version}</span>
-          </div>
-          <div className="setting-line">
-            <span className="muted">Process ID</span>
-            <span>{connection.daemon.pid}</span>
-          </div>
-        </section>
-      )}
-      {connection.state === "connected" && (
-        <SavedPreferences devices={connection.network?.devices ?? []} />
+        <SavedPreferences
+          devices={connection.network?.devices ?? []}
+          revision={revision}
+        />
       )}
       {connection.state === "connected" && (
         <section className="setting-group">
@@ -152,7 +195,100 @@ export function Settings({
   );
 }
 
-function SavedPreferences({ devices }: { devices: Device[] }) {
+function DesktopControls({
+  configuration,
+  update,
+}: {
+  configuration?: DesktopConfiguration;
+  update: (configuration: DesktopConfiguration) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function save(action: () => Promise<DesktopConfiguration>) {
+    setBusy(true);
+    setError("");
+    try {
+      update(await action());
+    } catch (error) {
+      setError(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="setting-group">
+      <h2>Desktop</h2>
+      {(error || configuration?.error) && (
+        <p className="message danger" role="alert">
+          {error || configuration?.error}
+        </p>
+      )}
+      {configuration && (
+        <>
+          {(
+            [
+              ["startDaemon", "Start daemon when Lyteboard opens"],
+              ["minimizeToTray", "Minimize to tray"],
+              ["closeToTray", "Close to tray"],
+            ] as const
+          ).map(([name, label]) => {
+            const enabled = configuration.preferences[name];
+            return (
+              <label className="setting-line preference-toggle" key={name}>
+                <span>{label}</span>
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  disabled={
+                    busy ||
+                    (!configuration.trayAvailable &&
+                      name !== "startDaemon" &&
+                      !enabled)
+                  }
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    void save(() =>
+                      api.setDesktopPreferences({
+                        ...configuration.preferences,
+                        [name]: checked,
+                      }),
+                    );
+                  }}
+                />
+              </label>
+            );
+          })}
+          <label className="setting-line preference-toggle">
+            <span>Open Lyteboard at login</span>
+            <input
+              type="checkbox"
+              checked={configuration.startsAtLogin}
+              disabled={busy}
+              onChange={(event) => {
+                const checked = event.target.checked;
+                void save(() => api.setLoginStartup(checked));
+              }}
+            />
+          </label>
+          <p className="muted">
+            {configuration.trayAvailable
+              ? "The tray sends to the devices selected on the Devices screen."
+              : "No system tray is available in this session. The daemon runs independently of this window."}
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+function SavedPreferences({
+  devices,
+  revision,
+}: {
+  devices: Device[];
+  revision: number;
+}) {
   const [clipboard, setClipboard] = useState<ClipboardPreferences>();
   const [history, setHistory] = useState<HistoryConfiguration>();
   const [clipboardError, setClipboardError] = useState("");
@@ -186,7 +322,7 @@ function SavedPreferences({ devices }: { devices: Device[] }) {
     return () => {
       active = false;
     };
-  }, [refresh]);
+  }, [refresh, revision]);
 
   async function changeClipboard(
     operation: () => Promise<ClipboardPreferences>,
@@ -263,7 +399,21 @@ function SavedPreferences({ devices }: { devices: Device[] }) {
                 }}
               />
             </label>
-            {clipboard.send && !clipboard.send_active && (
+            {clipboard.paused && (
+              <div className="setting-line">
+                <p className="muted">Automatic synchronization is paused.</p>
+                <button
+                  type="button"
+                  disabled={clipboardBusy}
+                  onClick={() =>
+                    void changeClipboard(() => api.setClipboardPause(false))
+                  }
+                >
+                  Resume synchronization
+                </button>
+              </div>
+            )}
+            {!clipboard.paused && clipboard.send && !clipboard.send_active && (
               <p className="muted">
                 Saved on. Clipboard monitoring is inactive.
               </p>
@@ -287,11 +437,13 @@ function SavedPreferences({ devices }: { devices: Device[] }) {
                 }}
               />
             </label>
-            {clipboard.apply && !clipboard.apply_active && (
-              <p className="muted">
-                Saved on. Automatic application is inactive.
-              </p>
-            )}
+            {!clipboard.paused &&
+              clipboard.apply &&
+              !clipboard.apply_active && (
+                <p className="muted">
+                  Saved on. Automatic application is inactive.
+                </p>
+              )}
             {clipboard.apply_error && (
               <p className="message danger" role="alert">
                 {clipboard.apply_error}

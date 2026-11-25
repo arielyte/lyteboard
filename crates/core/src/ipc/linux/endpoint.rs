@@ -81,6 +81,24 @@ impl Endpoint {
         Ok(self.runtime_dir.join(APP_DIR))
     }
 
+    /// Open or create the private runtime subdirectory used by Lyteboard.
+    pub fn private_directory(&self) -> Result<PathBuf, EndpointError> {
+        let dir = self.app_dir()?;
+        match DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(path_error("create IPC directory", &dir, error)),
+        }
+        let metadata = fs::symlink_metadata(&dir)
+            .map_err(|error| path_error("inspect IPC directory", &dir, error))?;
+        validate_directory(&dir, &metadata)?;
+        Ok(dir)
+    }
+
+    pub(in crate::ipc) fn lock_launcher(&self) -> Result<File, EndpointError> {
+        lock_server(&self.private_directory()?.join("launcher.lock"))
+    }
+
     pub(super) fn existing_socket(&self) -> Result<Option<PathBuf>, EndpointError> {
         let dir = self.app_dir()?;
         let Some(metadata) = metadata_if_exists(&dir)? else {
@@ -106,15 +124,7 @@ pub struct ServerSocket {
 
 impl ServerSocket {
     pub async fn bind(endpoint: &Endpoint) -> Result<Self, EndpointError> {
-        let dir = endpoint.app_dir()?;
-        match DirBuilder::new().mode(0o700).create(&dir) {
-            Ok(()) => (),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(path_error("create IPC directory", &dir, error)),
-        }
-        let metadata = fs::symlink_metadata(&dir)
-            .map_err(|error| path_error("inspect IPC directory", &dir, error))?;
-        validate_directory(&dir, &metadata)?;
+        let dir = endpoint.private_directory()?;
         let lock = lock_server(&dir.join(LOCK))?;
 
         let path = dir.join(SOCKET);

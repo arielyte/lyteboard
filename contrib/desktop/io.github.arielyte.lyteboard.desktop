@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lyteboard
+Comment=Share clipboard content with paired devices on your local network
+Exec=lyteboard-desktop
+Icon=io.github.arielyte.lyteboard
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;LAN;

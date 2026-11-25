@@ -204,7 +204,7 @@ pub(crate) async fn remove_device(id: String) -> Result<()> {
 #[derive(Serialize)]
 pub(crate) struct DeliveryView {
     id: String,
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[tauri::command]
@@ -221,7 +221,7 @@ pub(crate) async fn send_clipboard(recipients: Vec<String>) -> Result<Vec<Delive
 
 static SENDING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
-fn recipients(ids: Vec<String>) -> Result<Vec<String>> {
+pub(crate) fn recipients(ids: Vec<String>) -> Result<Vec<String>> {
     use std::collections::BTreeSet;
     let recipients = ids;
     let mut unique = BTreeSet::new();
@@ -410,6 +410,16 @@ pub(crate) async fn pair_cancel() -> Result<()> {
 pub(crate) async fn clipboard_preferences() -> Result<ClipboardPreferences> {
     let Reply::ClipboardPreferences(settings) =
         request(&client()?, Command::ClipboardPreferences).await?
+    else {
+        return Err(unexpected());
+    };
+    Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) async fn set_clipboard_pause(paused: bool) -> Result<ClipboardPreferences> {
+    let Reply::ClipboardPreferences(settings) =
+        request(&client()?, Command::SetClipboardPaused { paused }).await?
     else {
         return Err(unexpected());
     };

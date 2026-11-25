@@ -55,7 +55,11 @@ export function PairDialog({
     let stopped = false;
     let timer: number;
     const poll = async () => {
-      if (!task.current && document.visibilityState === "visible") {
+      if (
+        !task.current &&
+        document.visibilityState === "visible" &&
+        document.hasFocus()
+      ) {
         const current = revision.current;
         try {
           const status = await api.pairStatus();

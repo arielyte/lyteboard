@@ -7,6 +7,8 @@ pub use lyteboard_protocol::ipc::{Status, network};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
+pub mod lifecycle;
+#[cfg(target_os = "linux")]
 pub mod linux;
 
 #[derive(Debug, Error)]

@@ -1,11 +1,41 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
 mod desktop;
+#[cfg(target_os = "linux")]
+mod desktop_preferences;
+#[cfg(target_os = "linux")]
+mod instance;
+#[cfg(target_os = "linux")]
+mod lifecycle;
+#[cfg(target_os = "linux")]
+mod tray;
 
+#[cfg(target_os = "linux")]
 use desktop::*;
+#[cfg(target_os = "linux")]
+use lifecycle::*;
 
-fn main() -> tauri::Result<()> {
+#[cfg(target_os = "linux")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let instance = match instance::Instance::claim() {
+        Ok(Some(instance)) => Some(instance),
+        Ok(None) => return Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<lyteboard_core::ipc::linux::EndpointError>()
+                .is_some() =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
     tauri::Builder::default()
+        .setup(move |app| {
+            lifecycle::setup(app, instance);
+            Ok(())
+        })
+        .on_window_event(lifecycle::window_event)
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             devices_snapshot,
@@ -23,6 +53,7 @@ fn main() -> tauri::Result<()> {
             pair_cancel,
             clipboard_preferences,
             set_clipboard_sending,
+            set_clipboard_pause,
             set_clipboard_application,
             set_clipboard_recipient,
             history_configuration,
@@ -33,6 +64,19 @@ fn main() -> tauri::Result<()> {
             resend_history,
             delete_history,
             clear_history,
+            desktop_configuration,
+            set_desktop_preferences,
+            set_login_startup,
+            start_daemon,
+            stop_daemon,
+            select_tray_recipients,
+            minimize_to_tray,
         ])
-        .run(tauri::generate_context!())
+        .run(tauri::generate_context!())?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("The Lyteboard desktop currently runs on Linux.");
 }

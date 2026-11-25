@@ -39,6 +39,7 @@ export type HistoryPage = { entries: HistoryEntry[]; more: boolean };
 export type Preview =
   { kind: "text"; text: string } | { kind: "image"; data: string };
 export type ClipboardPreferences = {
+  paused: boolean;
   send: boolean;
   apply: boolean;
   peers: string[];
@@ -46,6 +47,19 @@ export type ClipboardPreferences = {
   apply_active: boolean;
   send_error: string | null;
   apply_error: string | null;
+};
+export type DesktopPreferences = {
+  startDaemon: boolean;
+  closeToTray: boolean;
+  minimizeToTray: boolean;
+};
+export type DesktopNotice = { message: string; error: boolean };
+export type DesktopConfiguration = {
+  preferences: DesktopPreferences;
+  trayAvailable: boolean;
+  startsAtLogin: boolean;
+  error: string | null;
+  lastNotice: DesktopNotice | null;
 };
 export type Invitation = {
   text: string;
@@ -66,6 +80,17 @@ export const discoveryLabels: Record<DiscoveryState, string> = {
 };
 
 export const api = {
+  desktopConfiguration: () =>
+    invoke<DesktopConfiguration>("desktop_configuration"),
+  setDesktopPreferences: (preferences: DesktopPreferences) =>
+    invoke<DesktopConfiguration>("set_desktop_preferences", { preferences }),
+  setLoginStartup: (enabled: boolean) =>
+    invoke<DesktopConfiguration>("set_login_startup", { enabled }),
+  startDaemon: () => invoke<void>("start_daemon"),
+  stopDaemon: () => invoke<void>("stop_daemon"),
+  selectTrayRecipients: (ids: string[]) =>
+    invoke<void>("select_tray_recipients", { ids }),
+  minimizeToTray: () => invoke<void>("minimize_to_tray"),
   daemon: () => invoke<DaemonStatus | null>("daemon_status"),
   devices: () => invoke<DevicesView>("devices_snapshot"),
   discover: () => invoke<NearbyDevice[]>("discover_devices"),
@@ -88,6 +113,8 @@ export const api = {
   cancelPair: () => invoke<void>("pair_cancel"),
   clipboardPreferences: () =>
     invoke<ClipboardPreferences>("clipboard_preferences"),
+  setClipboardPause: (paused: boolean) =>
+    invoke<ClipboardPreferences>("set_clipboard_pause", { paused }),
   setClipboardSending: (enabled: boolean) =>
     invoke<ClipboardPreferences>("set_clipboard_sending", { enabled }),
   setClipboardApplication: (enabled: boolean) =>

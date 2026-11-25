@@ -1,3 +1,5 @@
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
@@ -5,6 +7,8 @@ import {
   type DaemonStatus,
   type Device,
   type DevicesView,
+  type DesktopConfiguration,
+  type DesktopNotice,
 } from "./api";
 import { DiscoverDevices, ManageDevice } from "./DeviceDialogs";
 import { History } from "./History";
@@ -49,6 +53,10 @@ export function App() {
   const [selected, setSelected] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [desktop, setDesktop] = useState<DesktopConfiguration>();
+  const [daemonBusy, setDaemonBusy] = useState(false);
+  const [viewEpoch, setViewEpoch] = useState(0);
+  const dirty = useRef(false);
   const revision = useRef(0);
   const pending = useRef(false);
 
@@ -89,7 +97,10 @@ export function App() {
                 .map((device) => device.id),
             )
           : new Set<string>();
-      setSelected((previous) => previous.filter((id) => available.has(id)));
+      setSelected((previous) => {
+        const next = previous.filter((id) => available.has(id));
+        return next.length === previous.length ? previous : next;
+      });
       setConnection(next);
       setRefreshing(false);
       pending.current = false;
@@ -104,21 +115,92 @@ export function App() {
         document.hasFocus() &&
         !pending.current
       ) {
+        if (dirty.current) {
+          dirty.current = false;
+          setViewEpoch((value) => value + 1);
+        }
         void refresh();
       }
     };
+    let active = true;
+    const loadDesktop = async (initial = false) => {
+      try {
+        const config = await api.desktopConfiguration();
+        if (!active) return;
+        setDesktop(config);
+        if (initial && config.lastNotice) setNotice(config.lastNotice);
+      } catch (error) {
+        if (active) setNotice({ message: errorMessage(error), error: true });
+      }
+    };
+    const listeners = [
+      listen("desktop-changed", () => {
+        if (!active) return;
+        void loadDesktop();
+        visibleRefresh();
+      }),
+      listen<DesktopNotice>("desktop-notice", ({ payload }) => {
+        if (!active) return;
+        setNotice(payload);
+        dirty.current = true;
+      }),
+    ];
+    void loadDesktop(true);
     const timer = window.setInterval(visibleRefresh, 5000);
     window.addEventListener("focus", visibleRefresh);
     document.addEventListener("visibilitychange", visibleRefresh);
+    const closeShortcut = (event: KeyboardEvent) => {
+      if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === "w") {
+        event.preventDefault();
+        void getCurrentWindow()
+          .close()
+          .catch((error) => {
+            if (active)
+              setNotice({ message: errorMessage(error), error: true });
+          });
+      }
+    };
+    window.addEventListener("keydown", closeShortcut);
     return () => {
+      active = false;
+      for (const listener of listeners)
+        void listener.then((unlisten) => unlisten()).catch(() => {});
       revision.current += 1;
       pending.current = false;
       window.clearTimeout(initial);
       window.clearInterval(timer);
       window.removeEventListener("focus", visibleRefresh);
+      window.removeEventListener("keydown", closeShortcut);
       document.removeEventListener("visibilitychange", visibleRefresh);
     };
   }, [refresh]);
+
+  useEffect(() => {
+    void api.selectTrayRecipients(selected).catch((error) => {
+      setNotice({ message: errorMessage(error), error: true });
+    });
+  }, [selected]);
+
+  async function manageDaemon(start: boolean) {
+    setDaemonBusy(true);
+    setNotice(null);
+    try {
+      await (start ? api.startDaemon() : api.stopDaemon());
+    } catch (error) {
+      setNotice({ message: errorMessage(error), error: true });
+    } finally {
+      setDaemonBusy(false);
+      void refresh();
+    }
+  }
+
+  async function minimize() {
+    try {
+      await api.minimizeToTray();
+    } catch (error) {
+      setNotice({ message: errorMessage(error), error: true });
+    }
+  }
 
   const changed = useCallback(
     (message: string) => {
@@ -157,6 +239,7 @@ export function App() {
       setNotice({ message: errorMessage(error), error: true });
     } finally {
       setSending(false);
+      setViewEpoch((value) => value + 1);
       void refresh();
     }
   }
@@ -201,6 +284,17 @@ export function App() {
         <header className="page-header">
           <h1>{page}</h1>
           <div className="toolbar">
+            {desktop?.trayAvailable && desktop.preferences.minimizeToTray && (
+              <button
+                className="icon-button"
+                aria-label="Minimize to tray"
+                title="Minimize to tray"
+                type="button"
+                onClick={() => void minimize()}
+              >
+                −
+              </button>
+            )}
             <button
               className={page === "Devices" && network ? "icon-button" : ""}
               aria-label="Refresh daemon and devices"
@@ -235,13 +329,22 @@ export function App() {
           </div>
         </header>
 
-        {connection.state === "offline" && (
+        {connection.state === "offline" && page !== "Settings" && (
           <div className="message offline-message" role="status">
-            <strong>Start the Lyteboard daemon</strong>
-            <p>
-              Run <code>lyteboard daemon start</code> in your desktop session,
-              then refresh.
-            </p>
+            <div className="setting-line">
+              <div>
+                <strong>Lyteboard daemon is offline</strong>
+                <p>Start it to connect to your devices.</p>
+              </div>
+              <button
+                className="primary"
+                disabled={daemonBusy}
+                onClick={() => void manageDaemon(true)}
+                type="button"
+              >
+                {daemonBusy ? "Starting…" : "Start daemon"}
+              </button>
+            </div>
           </div>
         )}
         {connection.state === "error" && (
@@ -379,6 +482,7 @@ export function App() {
           <History
             key={connection.daemon.pid}
             devices={deviceList}
+            revision={viewEpoch}
             openSettings={() => setPage("Settings")}
           />
         )}
@@ -394,6 +498,11 @@ export function App() {
             setTheme={setTheme}
             connection={connection}
             changed={changed}
+            daemonBusy={daemonBusy}
+            manageDaemon={manageDaemon}
+            desktop={desktop}
+            setDesktop={setDesktop}
+            revision={viewEpoch}
           />
         )}
       </main>

@@ -242,13 +242,13 @@ impl Worker {
             let _ = self.ensure_ready().await;
         }
         if let Ok(values) = self.preferences.values() {
-            if values.apply {
+            if values.apply && !values.paused {
                 self.apply_error = self.start_clipboard_apply(false).await.err();
             }
             if !values.recipients.is_empty() {
                 if let Err(error) = self.load_recipients().await {
                     self.send_error = Some(error);
-                } else if values.send {
+                } else if values.send && !values.paused {
                     self.send_error = self.start_clipboard_send(false).await.err();
                 }
             }
@@ -430,6 +430,9 @@ impl Worker {
         if !self.activity.borrow().sync.has_recipients() {
             return Err("Select a paired device before enabling automatic sending.".into());
         }
+        if persist && self.preferences.values()?.paused {
+            return self.preferences.update(|values| values.send = true);
+        }
         if !self.activity.borrow().sync.is_enabled() {
             let clipboard = Clipboard::for_session().map_err(|error| error.to_string())?;
             let monitor = Monitor::start(clipboard)
@@ -448,6 +451,9 @@ impl Worker {
     }
 
     async fn start_clipboard_apply(&mut self, persist: bool) -> Result<(), String> {
+        if persist && self.preferences.values()?.paused {
+            return self.preferences.update(|values| values.apply = true);
+        }
         if !self.activity.borrow().clipboard.is_enabled() {
             let clipboard = Clipboard::for_session().map_err(|error| {
                 format!("{error} Restart lyteboardd from that graphical session to enable automatic writes.")
@@ -486,6 +492,7 @@ impl Worker {
             unreachable!()
         };
         Ok(Reply::ClipboardPreferences(ClipboardPreferences {
+            paused: saved.paused,
             send: saved.send,
             apply: saved.apply,
             peers: saved.recipients.iter().map(hex::encode).collect(),
@@ -494,6 +501,27 @@ impl Worker {
             send_error: send_error.or_else(|| self.send_error.clone()),
             apply_error: apply_error.or_else(|| self.apply_error.clone()),
         }))
+    }
+
+    async fn set_clipboard_paused(&mut self, paused: bool) -> Result<Reply, String> {
+        if paused {
+            let mut activity = self.activity.borrow_mut();
+            activity.sync.disable();
+            activity.clipboard.disable();
+        }
+        self.preferences.update(|values| values.paused = paused)?;
+        let saved = self.preferences.values()?;
+        self.apply_error = None;
+        self.send_error = None;
+        if !paused {
+            if saved.apply {
+                self.apply_error = self.start_clipboard_apply(false).await.err();
+            }
+            if saved.send {
+                self.send_error = self.start_clipboard_send(false).await.err();
+            }
+        }
+        self.clipboard_preferences()
     }
 
     async fn clipboard_sync(&mut self, command: ClipboardSyncCommand) -> Result<Reply, String> {
@@ -536,11 +564,16 @@ impl Worker {
                 self.activity.borrow_mut().sync.set_recipient(peer)?;
             }
         }
+        let paused = self.preferences.values().is_ok_and(|values| values.paused);
         let mut status = self.activity.borrow().sync.status();
         if let Reply::ClipboardSync { last_error, .. } = &mut status
             && last_error.is_none()
         {
-            *last_error = self.send_error.clone();
+            *last_error = if paused {
+                Some("Automatic synchronization is paused.".into())
+            } else {
+                self.send_error.clone()
+            };
         }
         Ok(status)
     }
@@ -556,6 +589,9 @@ impl Worker {
         match command {
             Command::ClipboardSync(command) => return self.clipboard_sync(command).await,
             Command::ClipboardPreferences => return self.clipboard_preferences(),
+            Command::SetClipboardPaused { paused } => {
+                return self.set_clipboard_paused(paused).await;
+            }
             Command::ClipboardAutoStatus => return Ok(self.clipboard_apply_status()),
             Command::SetClipboardAuto { enabled } => {
                 if enabled {
@@ -573,6 +609,7 @@ impl Worker {
         match command {
             Command::Listen { .. }
             | Command::ClipboardPreferences
+            | Command::SetClipboardPaused { .. }
             | Command::ClipboardAutoStatus
             | Command::ClipboardSync(_)
             | Command::SetClipboardAuto { .. } => unreachable!(),

@@ -73,6 +73,9 @@ pub enum Command {
     },
     ClipboardSync(ClipboardSyncCommand),
     ClipboardPreferences,
+    SetClipboardPaused {
+        paused: bool,
+    },
     History(HistoryCommand),
 }
 
@@ -199,6 +202,7 @@ pub struct HistoryConfiguration {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardPreferences {
+    pub paused: bool,
     pub send: bool,
     pub apply: bool,
     pub peers: Vec<String>,
@@ -395,6 +399,7 @@ mod tests {
         assert_eq!(decode::<Request>(&encoded).unwrap(), search);
         assert!(!format!("{search:?}").contains("\\\\"));
         let preferences = Response::Network(Reply::ClipboardPreferences(ClipboardPreferences {
+            paused: true,
             send: true,
             apply: true,
             peers: vec!["ff".repeat(32); MAX_RECIPIENTS],

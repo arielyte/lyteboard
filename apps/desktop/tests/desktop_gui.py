@@ -4,7 +4,9 @@
 import argparse
 import base64
 from contextlib import ExitStack
+import errno
 import json
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -318,19 +320,81 @@ def history_and_preferences(window, alpha, beta, clip, args):
     assert alpha.cli("ping") == "Pong"
 
 
+class DesktopDevice(Device):
+    """Also stop a daemon launched by the GUI rather than the test process."""
+
+    def stop(self):
+        if self.process is None and self.run("ping", check=False).returncode == 0:
+            self.cli("daemon", "stop")
+        else:
+            super().stop()
+
+
+def daemon_lifecycle(cleanup, args, window, alpha):
+    window.wait_text("Daemon offline")
+    window.click("Start daemon")
+    window.wait_text("Daemon running")
+    assert alpha.cli("ping") == "Pong"
+
+    window.page("Settings")
+    window.wait_text("No system tray is available")
+    window.click("Stop daemon")
+    window.wait_text("Daemon offline")
+    assert alpha.run("ping", check=False).returncode != 0
+    window.click("Start daemon")
+    window.wait_text("Daemon running")
+    status = alpha.cli("status")
+
+    assert alpha.cli("daemon", "start") == "Daemon already running"
+    assert alpha.cli("status").split("PID ")[1].split(",")[0] == status.split("PID ")[1].split(",")[0]
+    window.click("Stop daemon")
+    window.wait_text("Daemon offline")
+    children = [subprocess.Popen(
+        [str(ROOT / "target/debug/lyteboard"), "daemon", "start"], env=alpha.env,
+        stdout=subprocess.PIPE, text=True,
+    ) for _ in range(4)]
+    outcomes = [child.communicate(timeout=6)[0].strip() for child in children]
+    assert all(child.returncode == 0 for child in children)
+    assert outcomes.count("Daemon started") == 1
+    assert outcomes.count("Daemon already running") == 3
+    window.wait_text("Daemon running")
+
+    assert not window.checked("Start daemon when Lyteboard opens")
+    assert not window.checked("Open Lyteboard at login")
+    login_entry = Path(alpha.env["XDG_CONFIG_HOME"]) / "autostart/io.github.arielyte.lyteboard.desktop"
+    window.check("Open Lyteboard at login", True)
+    assert login_entry.exists() and "Terminal=false" in login_entry.read_text()
+    window.check("Open Lyteboard at login", False)
+    assert not login_entry.exists()
+    window.check("Start daemon when Lyteboard opens", True)
+
+    window.close()
+    assert alpha.cli("ping") == "Pong"
+    alpha.stop()
+    window = Window(args, alpha.env, cleanup)
+    window.wait_text("Daemon running")
+    assert alpha.cli("ping") == "Pong"
+    window.page("Settings")
+    assert window.checked("Start daemon when Lyteboard opens")
+    window.check("Start daemon when Lyteboard opens", False)
+    window.page("Devices")
+    return window
+
+
 def exercise(root, cleanup, args):
     env = isolated_keyring(root, cleanup)
     env.update(LYTEBOARD_HISTORY="off", LYTEBOARD_DISCOVERY="on")
-    alpha, beta, gamma = [Device(root, name, env) for name in ("Alpha", "Beta", "Gamma")]
+    alpha = DesktopDevice(root, "Alpha", env)
+    beta, gamma = [Device(root, name, env) for name in ("Beta", "Gamma")]
     clip = KwinSelection(root, alpha, cleanup)
     for device in (alpha, beta, gamma):
         cleanup.callback(device.stop)
     window = Window(args, alpha.env, cleanup)
-    window.wait_text("Daemon offline")
-    window.wait_text("lyteboard daemon start")
+    window = daemon_lifecycle(cleanup, args, window, alpha)
 
-    for device in (alpha, beta, gamma):
+    for device in (beta, gamma):
         device.start()
+    for device in (alpha, beta, gamma):
         device.env["LYTEBOARD_LISTEN_ADDR"] = device.listener("status")
     gamma_address = gamma.env["LYTEBOARD_LISTEN_ADDR"]
     window.refresh()
@@ -345,13 +409,18 @@ def exercise(root, cleanup, args):
     window.click("Pair device")
     window.click("Generate QR")
     qr = wait_for(lambda: window.js("return document.querySelector('.qr-wrap svg') ?? null;"))
-    qr_image = window.capture(qr) if shutil.which("zbarimg") else None
+    decoded = None
+    if shutil.which("zbarimg"):
+        def scan_qr():
+            # A DOM element can be present just before WebKit paints its first frame.
+            result = subprocess.run(["zbarimg", "--quiet", "--raw", "-"], input=window.capture(qr),
+                                    capture_output=True)
+            return result.stdout.decode().strip() if result.returncode == 0 else None
+        decoded = wait_for(scan_qr)
     window.click("Show invitation text")
     invitation = window.js("return document.querySelector('textarea').value;")
     assert invitation.startswith("lyteboard-lan:v1:")
-    if qr_image:
-        decoded = subprocess.run(["zbarimg", "--quiet", "--raw", "-"], input=qr_image,
-                                 capture_output=True, check=True).stdout.decode().strip()
+    if decoded:
         assert decoded == invitation
     beta.cli("pair", "accept", input_text=invitation + "\n")
     compare_and_pair(window, beta)
@@ -401,7 +470,6 @@ def exercise(root, cleanup, args):
 
     gamma.stop()
     wait_for(lambda: alpha.devices()["Gamma"][2] != "online")
-    window.refresh()
     wait_for(lambda: window.peer_states().get("Gamma") in ("offline", "connecting"))
     gamma.start()
     wait_for(lambda: alpha.devices()["Gamma"][2] == "online")
@@ -436,6 +504,46 @@ def exercise(root, cleanup, args):
     assert alpha.cli("ping") == "Pong"
 
 
+def startup_errors(root, cleanup, args):
+    env = isolated_keyring(root, cleanup)
+    no_daemon = root / "missing-daemon"
+    no_daemon.mkdir()
+    binary = no_daemon / "lyteboard-desktop"
+    shutil.copy2(Path(args.binary).resolve(), binary)
+    missing = Device(root, "Missing", env)
+    KwinSelection(root, missing, cleanup)
+    window = Window(argparse.Namespace(**{**vars(args), "binary": str(binary)}), missing.env, cleanup)
+    window.wait_text("Daemon offline")
+    window.click("Start daemon")
+    window.wait_text("Install lyteboardd alongside the Lyteboard executable.")
+    assert missing.run("ping", check=False).returncode != 0
+    window.close()
+
+    locked = DesktopDevice(root, "Locked", env)
+    KwinSelection(root, locked, cleanup)
+    cleanup.callback(locked.stop)
+    window = Window(args, locked.env, cleanup)
+    window.wait_text("Daemon offline")
+    window.click("Start daemon")
+    window.wait_text("No paired devices")
+    window.page("Settings")
+    window.click("Stop daemon")
+    window.wait_text("Daemon offline")
+
+    def secret_service(method, value):
+        return subprocess.check_output([
+            "gdbus", "call", "--session", "--dest", "org.freedesktop.secrets",
+            "--object-path", "/org/freedesktop/secrets", "--method",
+            "org.freedesktop.Secret.Service." + method, value,
+        ], env=env, text=True, timeout=5)
+    collection, = re.findall(r"'([^']+)'", secret_service("ReadAlias", "default"))
+    secret_service("Lock", f"[objectpath '{collection}']")
+    window.click("Start daemon")
+    window.wait_text("Secret Service is locked. Unlock your desktop keyring and retry.")
+    assert locked.cli("ping") == "Pong"
+    window.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", default="tauri-driver")
@@ -444,8 +552,23 @@ def main():
     parser.add_argument("--lan-ip", default="127.0.0.1", help="use an on-link IPv4 address to also test real mDNS")
     parser.add_argument("--screenshots", type=Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="lyteboard-desktop-") as directory, ExitStack() as cleanup:
-        exercise(Path(directory), cleanup, args)
+    root = Path(tempfile.mkdtemp(prefix="lyteboard-desktop-"))
+    try:
+        with ExitStack() as cleanup:
+            exercise(root, cleanup, args)
+            errors = root / "errors"
+            errors.mkdir()
+            startup_errors(errors, cleanup, args)
+    finally:
+        # On shutdown KWin can finish writing its output configuration after the session wrapper exits.
+        for attempt in range(5):
+            try:
+                shutil.rmtree(root)
+                break
+            except OSError as error:
+                if error.errno != errno.ENOTEMPTY or attempt == 4:
+                    raise
+                time.sleep(0.2)
     print("Native Lyteboard GUI checks passed.")
 
 

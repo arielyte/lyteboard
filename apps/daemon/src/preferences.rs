@@ -36,6 +36,7 @@ pub(super) struct Values {
     pub discovery: Option<bool>,
     pub send: bool,
     pub apply: bool,
+    pub paused: bool,
     pub recipients: BTreeSet<NoiseKey>,
     pub history: Option<HistorySettings>,
 }

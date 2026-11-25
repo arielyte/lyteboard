@@ -70,9 +70,11 @@ function EntryPreview({ entry }: { entry: HistoryEntry }) {
 export function History({
   devices,
   openSettings,
+  revision,
 }: {
   devices: Device[];
   openSettings: () => void;
+  revision: number;
 }) {
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
@@ -107,7 +109,7 @@ export function History({
     return () => {
       active = false;
     };
-  }, [cursor, query, refresh]);
+  }, [cursor, query, refresh, revision]);
 
   async function mutate(
     operation: () => Promise<void>,

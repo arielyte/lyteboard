@@ -224,6 +224,74 @@ All 84 affected Rust tests passed, along with Clippy, frontend formatting, lint,
 
 Full history items remain available for copying or resending. The GUI shows previews only. History search covers text payloads and does not index images. Stored passwords and other sensitive clipboard content can be readable by same-user processes and backups. System tray and automatic daemon startup remain deferred.
 
+## LAN-5C checkpoint
+
+The desktop can start and stop the daemon from Settings. The offline view also offers **Start daemon**. Both desktop and CLI start the installed sibling `lyteboardd` through the same launcher. A private launcher lock serializes concurrent starts, and the daemon retains its own socket lock and same-user authentication. Startup errors identify missing binaries or readiness failures. A locked Secret Service leaves the daemon reachable and shows the keyring error in the LAN controls.
+
+The native KDE StatusNotifier tray can open Lyteboard, send the clipboard to the selection on the Devices screen, pause or resume both automatic clipboard directions, show connection status, quit the GUI, or explicitly stop the daemon and quit. Pausing preserves recipient and direction preferences across daemon restarts. The Settings screen can resume synchronization if the tray becomes unavailable. A second GUI launch activates the existing window for that runtime profile. Closing or quitting the GUI leaves the daemon running. [StatusNotifier tray library](https://docs.rs/ksni/0.3.7/ksni/)
+
+**Start daemon when Lyteboard opens**, **Open Lyteboard at login**, **Close to tray**, and **Minimize to tray** are opt-in. Desktop preferences live in the private Lyteboard configuration directory. Login startup uses a user XDG autostart desktop entry. The app installs no system services. In sessions without a usable tray, the window closes normally. Native minimize-to-tray follows GTK iconification notifications where supplied. KDE Wayland exposes an explicit **Minimize to tray** toolbar button when enabled, since compositor minimize notifications may be unavailable to the client.
+
+The foreground device view refreshes on focus and at five-second intervals while focused and visible. Desktop actions emit local events for immediate refresh, and pairing status is polled only while the pairing window is active. The tray refreshes its status when the menu is used and otherwise checks every 15 seconds. Hidden GUI views suspend foreground polling.
+
+### Install and remove on Linux
+
+The release desktop binary expects `lyteboardd` in the same directory. CLI-only users can install just `lyteboard` and `lyteboardd`. From the repository root, build the two command-line binaries and install them into your user bin directory.
+
+```bash
+cargo build --locked --release -p lyteboard-cli -p lyteboard-daemon
+bin="$HOME/.local/bin"
+install -Dm755 target/release/lyteboard "$bin/lyteboard"
+install -Dm755 target/release/lyteboardd "$bin/lyteboardd"
+```
+
+For the GUI, install the desktop dependencies listed in the README and the `desktop-file-utils` package. Build the native window and install its launcher and icon. The launcher uses the executable's absolute path, so the graphical session can open Lyteboard from its application menu.
+
+```bash
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+bin="$HOME/.local/bin"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+install -Dm755 target/release/lyteboard-desktop "$bin/lyteboard-desktop"
+install -Dm644 apps/desktop/src-tauri/icons/icon.png \
+  "$data/icons/hicolor/256x256/apps/io.github.arielyte.lyteboard.png"
+mkdir -p "$data/applications"
+desktop-file-install --dir="$data/applications" \
+  --set-key=Exec --set-value="\"$bin/lyteboard-desktop\"" \
+  --set-key=TryExec --set-value="$bin/lyteboard-desktop" \
+  contrib/desktop/io.github.arielyte.lyteboard.desktop
+```
+
+To remove the GUI, disable **Open Lyteboard at login** in Settings, quit the GUI, then remove its executable, launcher, and icon.
+
+```bash
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+rm -- "$HOME/.local/bin/lyteboard-desktop" \
+  "$data/applications/io.github.arielyte.lyteboard.desktop" \
+  "$data/icons/hicolor/256x256/apps/io.github.arielyte.lyteboard.png"
+```
+
+To remove the CLI-only installation, stop the daemon with `~/.local/bin/lyteboard daemon stop` if it is running and remove `~/.local/bin/lyteboard` and `~/.local/bin/lyteboardd`. These steps preserve your profile, clipboard history, and saved settings. If you previously installed the optional systemd user unit, follow the explicit removal steps in the [daemon guide](daemon.md).
+
+### Verification
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+cargo build --locked --release -p lyteboard-cli -p lyteboard-daemon
+npm --prefix apps/desktop run format:check
+npm --prefix apps/desktop run lint
+npm --prefix apps/desktop run typecheck
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+desktop-file-validate contrib/desktop/io.github.arielyte.lyteboard.desktop
+cargo test --locked -p lyteboard-core -p lyteboard-protocol -p lyteboard-daemon -p lyteboard-cli -p lyteboard-desktop
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_tray.py
+```
+
+Use the WebDriver prerequisites from LAN-5A. The tray harness also needs Python GObject bindings and an active Plasma tray host on the current session bus. It controls the real tray menu over D-Bus, while the test window and clipboard use isolated KWin sessions. The GUI harness also tests the session-without-tray fallback. The login toggle creates and removes the native entry. Verification does not require logging out of the current desktop session.
+
+Both native harnesses passed. Verification covered starting, stopping and reopening the GUI and daemon, four concurrent start requests, missing binaries, a locked keyring, live peer status, existing pairing, history, settings and transfers, the desktop launcher, and all tray actions. The login entry was created and removed in a temporary configuration. A full login cycle remains unverified. Frontend formatting, lint, typecheck, build, the locked Tauri build, desktop-file validation, Clippy, all 85 affected Rust tests, and the LAN and history CLI harnesses passed.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
