@@ -2,13 +2,12 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
-use lyteboard_core::bulk::{Error, Payload, Receiver};
+use lyteboard_core::bulk::{Error, Payload, Receiver, Sender};
 use lyteboard_protocol::{
     ipc::network::{MAX_TEST_TEXT_BYTES, Message},
-    peer::{BulkRecord, CHUNK_BYTES, MAX_IMAGE_BYTES, Manifest, NoiseKey, TransferId},
+    peer::{BulkRecord, MAX_IMAGE_BYTES, Manifest, NoiseKey, TransferId},
 };
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
-use zeroize::Zeroizing;
 
 const INBOX_LIMIT: usize = 16;
 const INBOX_BYTES: usize = 2 * MAX_IMAGE_BYTES;
@@ -102,8 +101,7 @@ pub(super) struct Outgoing {
     pub job: u64,
     pub expires: Instant,
     progress: Instant,
-    offset: usize,
-    next: u32,
+    sender: Sender,
     batch: Arc<Batch>,
 }
 
@@ -114,8 +112,7 @@ impl Outgoing {
             id,
             job,
             batch,
-            offset: 0,
-            next: 0,
+            sender: Sender::default(),
             expires: now + TRANSFER_TIMEOUT,
             progress: now + PROGRESS_TIMEOUT,
         }
@@ -134,22 +131,8 @@ impl Outgoing {
     }
 
     pub fn credit(&mut self, id: TransferId, next: u32) -> Result<BulkRecord, Error> {
-        if id != self.id || next != self.next {
-            return Err(Error::Sequence);
-        }
-        let bytes = self.batch.payload.bytes();
-        if self.offset == bytes.len() {
-            return Ok(BulkRecord::End { id });
-        }
-        let end = (self.offset + CHUNK_BYTES).min(bytes.len());
-        let chunk = Zeroizing::new(bytes[self.offset..end].to_vec());
-        self.offset = end;
-        self.next += 1;
+        let record = self.sender.credit(self.id, &self.batch.payload, id, next)?;
         self.progress = Instant::now() + PROGRESS_TIMEOUT;
-        Ok(BulkRecord::Chunk {
-            id,
-            index: next,
-            bytes: chunk,
-        })
+        Ok(record)
     }
 }

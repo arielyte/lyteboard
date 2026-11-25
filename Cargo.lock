@@ -2516,9 +2516,14 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 name = "lyteboard-android"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "jni",
  "lyteboard-core",
  "lyteboard-protocol",
+ "thiserror 2.0.21",
+ "tokio",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]

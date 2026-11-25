@@ -1,13 +1,12 @@
-//! Linux peer profiles and Secret Service credentials.
-//! Key material is stored in the user's Secret Service.
+//! Durable peer profiles and platform-protected credentials.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs::{File, TryLockError},
     io::{self, Read, Write},
     net::SocketAddr,
     os::unix::fs::MetadataExt,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 
 use lyteboard_protocol::peer::{NoiseKey, RouteId, validate_label, validate_lan_address};
@@ -16,10 +15,14 @@ use rustix::{
     io::Errno,
     process::geteuid,
 };
+#[cfg(target_os = "linux")]
 use secret_service::{EncryptionType, blocking::SecretService};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::{collections::HashMap, path::PathBuf};
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
+#[cfg(target_os = "linux")]
 use zeroize::Zeroizing;
 
 use super::{
@@ -72,6 +75,7 @@ impl From<Errno> for StorageError {
 }
 
 /// Open a durable LAN endpoint, creating its identity on first use. Call on a blocking thread.
+#[cfg(target_os = "linux")]
 pub fn open_endpoint(path: &Path) -> Result<Endpoint, StorageError> {
     let profile = Profile::open(path)?;
     let namespace = profile.namespace.clone();
@@ -80,8 +84,38 @@ pub fn open_endpoint(path: &Path) -> Result<Endpoint, StorageError> {
     })
 }
 
+/// Open a profile under the application's Android no-backup directory.
+#[cfg(target_os = "android")]
+pub fn open_android_endpoint(
+    directory: &Path,
+    store: &mut impl CredentialStore,
+) -> Result<Endpoint, StorageError> {
+    if !directory.is_absolute() {
+        return Err(StorageError::UnsafePath);
+    }
+    // Android app sandboxes cannot open every ancestor for reading. The parent
+    // is supplied by Context.getNoBackupFilesDir inside this application.
+    let parent = File::open(directory)?;
+    let name = "peer-profile";
+    match mkdirat(&parent, name, Mode::RWXU) {
+        Ok(()) => parent.sync_all()?,
+        Err(Errno::EXIST) => (),
+        Err(error) => return Err(error.into()),
+    }
+    let dir = File::from(openat(
+        &parent,
+        name,
+        READ_FLAGS | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?);
+    check_private_dir(&dir)?;
+    let lock = lock_named(&dir, "profile.lock")?;
+    Profile { dir, _lock: lock }.load(store)
+}
+
 struct Profile {
     dir: File,
+    #[cfg(target_os = "linux")]
     namespace: String,
     _lock: File,
 }
@@ -105,6 +139,7 @@ impl Owner {
 }
 
 impl Profile {
+    #[cfg(target_os = "linux")]
     fn open(path: &Path) -> Result<Self, StorageError> {
         if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
             return Err(StorageError::UnsafePath);
@@ -394,11 +429,19 @@ pub fn open_private_dir(path: &Path) -> Result<File, StorageError> {
         };
         dir = File::from(next);
     }
+    check_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn check_private_dir(dir: &File) -> Result<(), StorageError> {
     let metadata = dir.metadata()?;
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o777 != 0o700 {
+    if !metadata.is_dir()
+        || metadata.uid() != geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
         return Err(StorageError::UnsafePath);
     }
-    Ok(dir)
+    Ok(())
 }
 
 /// Exclusively lock a private file inside a previously checked directory.
@@ -425,10 +468,12 @@ pub fn check_private_file(file: &File) -> Result<(), StorageError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 struct ServiceStore<'a> {
     namespace: &'a str,
 }
 
+#[cfg(target_os = "linux")]
 impl ServiceStore<'_> {
     fn attributes(&self) -> HashMap<&str, &str> {
         HashMap::from([
@@ -439,6 +484,7 @@ impl ServiceStore<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl CredentialStore for ServiceStore<'_> {
     fn load(&self) -> Result<Option<Credentials>, CredentialError> {
         let service = SecretService::connect(EncryptionType::Dh).map_err(credential_error)?;
@@ -503,6 +549,7 @@ impl CredentialStore for ServiceStore<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn is_session_path<'a>(
     service: &'a SecretService<'a>,
     path: &str,
@@ -521,6 +568,7 @@ fn is_session_path<'a>(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn credential_error(error: secret_service::Error) -> CredentialError {
     match error {
         secret_service::Error::Locked => CredentialError::Locked,
@@ -529,5 +577,5 @@ fn credential_error(error: secret_service::Error) -> CredentialError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

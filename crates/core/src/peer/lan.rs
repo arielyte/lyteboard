@@ -339,7 +339,7 @@ impl Link {
     fn new(stream: TcpStream, local: NoiseKey) -> Result<Self, Error> {
         // Small authenticated credit records must not wait behind TCP's delayed ACKs.
         stream.set_nodelay(true)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             use rustix::net::sockopt;
             let configure = || -> io::Result<()> {
@@ -401,7 +401,7 @@ fn now() -> Result<Time, Error> {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::Clock)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let monotonic = {
         use rustix::time::{ClockId, clock_gettime};
 
@@ -411,7 +411,7 @@ fn now() -> Result<Time, Error> {
             boot.tv_nsec.try_into().map_err(|_| Error::Clock)?,
         )
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let monotonic = {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed()

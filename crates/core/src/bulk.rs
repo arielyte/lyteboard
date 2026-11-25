@@ -11,7 +11,7 @@ use image::{
     },
 };
 pub use lyteboard_protocol::peer::Media;
-use lyteboard_protocol::peer::{CHUNK_BYTES, Manifest, PeerFailure, TransferId};
+use lyteboard_protocol::peer::{BulkRecord, CHUNK_BYTES, Manifest, PeerFailure, TransferId};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -138,6 +138,40 @@ pub fn validate_size(media: Media, size: usize) -> Result<(), Error> {
         Err(Error::TooLarge(media.limit()))
     } else {
         Ok(())
+    }
+}
+
+/// Ordered chunk cursor shared by LAN senders. Every chunk requires a peer credit.
+#[derive(Default)]
+pub struct Sender {
+    offset: usize,
+    next: u32,
+}
+
+impl Sender {
+    pub fn credit(
+        &mut self,
+        expected: TransferId,
+        payload: &Payload,
+        id: TransferId,
+        next: u32,
+    ) -> Result<BulkRecord, Error> {
+        if id != expected || next != self.next {
+            return Err(Error::Sequence);
+        }
+        let bytes = payload.bytes();
+        if self.offset == bytes.len() {
+            return Ok(BulkRecord::End { id });
+        }
+        let end = (self.offset + CHUNK_BYTES).min(bytes.len());
+        let chunk = Zeroizing::new(bytes[self.offset..end].to_vec());
+        self.offset = end;
+        self.next += 1;
+        Ok(BulkRecord::Chunk {
+            id,
+            index: next,
+            bytes: chunk,
+        })
     }
 }
 

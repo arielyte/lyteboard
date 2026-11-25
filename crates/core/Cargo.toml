@@ -22,10 +22,12 @@ x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 zeroize = "1.8"
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 rustix = { workspace = true, features = ["event", "fs", "net", "time"] }
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "6.0.0", default-features = false, features = ["rt-default", "crypto-rust"] }
 tokio = { workspace = true, features = ["process"] }
 wl-clipboard-rs = "0.9.5"

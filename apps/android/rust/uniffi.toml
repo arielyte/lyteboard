@@ -1,3 +1,4 @@
 [crates.lyteboard_android.bindings.kotlin]
 package_name = "app.lyteboard.core"
 generate_immutable_records = true
+android_cleaner = true

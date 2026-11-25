@@ -1,6 +1,6 @@
 # Lyteboard development handoff
 
-Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. The Kotlin Android app has a Rust interoperability foundation. Android clipboard sharing and Windows support are future work.
+Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. The Kotlin Android app pairs with Linux and exchanges test text and images. Android clipboard sharing and Windows support are future work.
 
 ## LAN-1 checkpoint
 
@@ -312,6 +312,27 @@ The arm64 Rust check and focused Clippy passed. The Android dependency tree excl
 
 The debug APK built and passed `zipalign -c -P 16 4`. The packaged Rust and JNA ELF segments also use 16 KiB alignment. Android lint reported zero errors and eight warnings covering dependency updates, the arm64-only target, launcher icon, and backup configuration. A standalone Kotlin/JVM test loaded the host build of the same UniFFI bridge. On an Android 16 Google APIs emulator, ADB forced the arm64-v8a APK and reported `primaryCpuAbi=arm64-v8a`. The launched Compose screen displayed `Rust core 0.1.0` and `LAN protocol 1` through the ARM translation layer. No physical Android device was connected.
 
+## LAN-6B checkpoint
+
+Android imports existing Linux invitations and requires both devices to approve the displayed verification code. The UniFFI bridge uses the shared Rust pairing, Noise KK, TCP, payload validation, and bulk sender and receiver. Android initiates sessions and both peers can send through them. The Compose test screen supports multiple paired devices, numeric IP and port entry, text sending, system file-picker image sending, received text preview, explicit saving, and revocation. Transfers retain the shared 1 MiB UTF-8 and 10 MiB PNG, JPEG, or WebP limits. The app keeps the latest received item in memory.
+
+The private identity is sealed with a non-exportable Android Keystore AES-GCM key. The Rust credential adapter passes seed buffers only through private JNI calls for storage. UniFFI exposes public IDs and operations. The versioned trust snapshot and revocation tombstones use the existing atomic storage implementation. Both files are under Android's app-private no-backup directory. Missing or unusable keys fail profile open and require restoring the original profile or explicitly resetting the app data.
+
+The Android activity closes sessions and cancels pairing and discovery when it stops. While visible, the app reconnects with a delay capped at 30 seconds. It accepts Android NSD results for previously trusted pins as hints and requires the destination to be on a local interface subnet. An authenticated connection updates the saved address. There is no Android listener or advertisement, so Linux can send after Android connects. Android clipboard access, background services, Android-to-Android pairing, and scoped IPv6 link-local addresses remain outside this checkpoint. [Android setup and manual Linux commands](../apps/android/README.md)
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+apps/android/gradlew -p apps/android :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
+PYTHONDONTWRITEBYTECODE=1 python3 apps/android/tests/lan_emulator.py emulator-5562
+cargo clippy --locked -p lyteboard-android --target aarch64-linux-android -- -D warnings
+cargo test --locked --workspace
+git diff --check
+```
+
+The test uses an Android 16 Google APIs emulator running the arm64-v8a APK through Android's ARM native bridge and two separate Linux daemons. Linux listeners use host loopback and the harness maps the invitation IP to the emulator's `10.0.2.2` host alias. The host-side clipboard adapter is file-backed for byte comparisons. Physical Android devices and Android NSD multicast resolution across a Wi-Fi LAN remain unverified.
+
+The emulator test passed pairing with both Linux peers, bidirectional chunked Unicode and PNG/JPEG/WebP with integrity checks, a manual listener-port change, identity and trust across process restarts, foreground disconnect and reconnect, and persistent revocation. The app and instrumentation APKs assembled successfully. The app APK passed 16 KiB ZIP alignment and Android lint reported zero errors and seven advisory warnings. All 85 Rust workspace tests passed, along with focused Clippy, formatting, and diff checks.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -504,4 +525,4 @@ cargo test --locked --workspace
 
 ## Remaining work
 
-Discovery and daemon integration are Linux-only. Binding to a new local IP after DHCP or interface changes still requires changing the listener or restarting the daemon with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use the paired device’s manual address for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails.
+Daemon integration and service advertisement are Linux-only. Binding to a new local IP after DHCP or interface changes still requires changing the listener or restarting the daemon with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use the paired device’s manual address for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails.

@@ -1,6 +1,6 @@
 # Lyteboard Android development
 
-LAN-6A builds an arm64-v8a Android app for API 26 and later. Its Compose screen calls `coreInfo()` through UniFFI and displays the Rust core build version and the LAN peer wire version. Gradle builds the native library using the NDK, then generates the Kotlin bindings from that library's UniFFI metadata.
+The app supports arm64-v8a on Android API 26 and later. Gradle builds the Rust library using the NDK and generates Kotlin bindings from the library's UniFFI metadata. The Compose screen can pair with Linux, show connection state, and exchange test text and images.
 
 ## CachyOS setup
 
@@ -82,3 +82,39 @@ On a CachyOS x86_64 host with KVM, the Android 16 Google APIs emulator can run t
 ```
 
 Run the ADB commands from a second shell with `ANDROID_SERIAL=emulator-5562` exported. Stop that emulator with `adb -s emulator-5562 emu kill`.
+
+## Pair and exchange test content
+
+On Linux, bind to the actual Wi-Fi or Ethernet IP on the same subnet as Android. Use an isolated Linux profile if testing revocation. Keep the invitation private until you paste it into Lyteboard.
+
+```bash
+lyteboard daemon start
+read -r -p 'Linux LAN IPv4 address: ' linux_ip
+lyteboard network listen "$linux_ip:47851"
+lyteboard pair invite
+# Paste the invitation into Android and tap Import invitation.
+lyteboard pair status
+# Compare both screens, enter the Linux code on Android, and tap Approve.
+lyteboard pair confirm
+# Enter the code displayed on Android.
+lyteboard devices list
+read -r -p 'Android device ID: ' android_id
+lyteboard send "$android_id" 'Hello from Linux ✓'
+wl-copy --type image/png --sensitive < sample.png
+lyteboard clipboard send "$android_id"
+sha256sum sample.png
+```
+
+Use **View text** or **Save received item** on Android. Compare the displayed SHA-256 with the Linux hash. Select Linux in **Trusted devices**, then use **Send text** or **Send image**. For an Android image sent to Linux, run `lyteboard clipboard copy` and `wl-paste --no-newline --type image/png | sha256sum`. Use the matching MIME type for JPEG or WebP.
+
+Android initiates the session. Both peers can send once it is connected. Reopen the Android app to reconnect or select the device and enter a numeric IP and port. Android NSD provides address hints for already paired peers. Android's `INTERNET` manifest permission enables LAN sockets at target SDK 36. Dials are restricted to local interface subnets and verified against the stored Noise pin. [Android LAN permissions](https://developer.android.com/privacy-and-security/local-network-permission)
+
+For automated verification, start a disposable API 36 emulator with empty Lyteboard app data and an `adb` executable on PATH. On Linux, install `dbus` and `gnome-keyring` if absent. From the repository root run:
+
+```bash
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+apps/android/gradlew -p apps/android :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
+PYTHONDONTWRITEBYTECODE=1 python3 apps/android/tests/lan_emulator.py emulator-5562
+```
+
+The test runner is in the separate instrumentation APK. It exchanges data with two real Linux daemons. Linux clipboard input and output use an isolated file-backed test adapter. The emulator reaches Linux host loopback at `10.0.2.2`, so the harness changes only the address hint in Linux-generated invitations.

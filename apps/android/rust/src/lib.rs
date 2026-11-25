@@ -15,3 +15,7 @@ pub fn core_info() -> CoreInfo {
         protocol_version: lyteboard_protocol::peer::VERSION,
     }
 }
+
+#[cfg(target_os = "android")]
+mod keystore;
+mod mobile;
