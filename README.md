@@ -1,6 +1,6 @@
 # Lyteboard
 
-Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Linux is the first target, with Windows and a Kotlin Android companion planned.
+Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Clipboard sharing is available on Linux. The Kotlin Android app currently demonstrates its Rust bridge, and Windows support is planned.
 
 The Linux desktop window and CLI use the same daemon to pair devices and share encrypted clipboard text and images. Paired devices reconnect using mDNS or a saved LAN address. The CLI also manages opt-in clipboard history and automatic synchronization. [Development state](docs/DEV_STATE.md)
 
@@ -11,6 +11,7 @@ The Linux desktop window and CLI use the same daemon to pair devices and share e
 | `apps/desktop/` | React and Vite frontend with a Tauri Rust shell in `src-tauri/` |
 | `apps/cli/` | `lyteboard` command-line entry point |
 | `apps/daemon/` | `lyteboardd` Linux daemon |
+| `apps/android/` | Compose app and UniFFI bridge. [Android development guide](apps/android/README.md) |
 | `crates/core/` | Shared Linux daemon client, device pairing, and encrypted peer sessions |
 | `crates/protocol/` | Versioned IPC and peer protocol boundary |
 | `contrib/systemd/` | Optional systemd user unit |

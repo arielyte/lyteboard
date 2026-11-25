@@ -1,6 +1,6 @@
 # Lyteboard development handoff
 
-Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. Windows and a Kotlin Android companion are future targets.
+Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. The Kotlin Android app has a Rust interoperability foundation. Android clipboard sharing and Windows support are future work.
 
 ## LAN-1 checkpoint
 
@@ -291,6 +291,26 @@ PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_tray.py
 Use the WebDriver prerequisites from LAN-5A. The tray harness also needs Python GObject bindings and an active Plasma tray host on the current session bus. It controls the real tray menu over D-Bus, while the test window and clipboard use isolated KWin sessions. The GUI harness also tests the session-without-tray fallback. The login toggle creates and removes the native entry. Verification does not require logging out of the current desktop session.
 
 Both native harnesses passed. Verification covered starting, stopping and reopening the GUI and daemon, four concurrent start requests, missing binaries, a locked keyring, live peer status, existing pairing, history, settings and transfers, the desktop launcher, and all tray actions. The login entry was created and removed in a temporary configuration. A full login cycle remains unverified. Frontend formatting, lint, typecheck, build, the locked Tauri build, desktop-file validation, Clippy, all 85 affected Rust tests, and the LAN and history CLI harnesses passed.
+
+## LAN-6A checkpoint
+
+`apps/android` is a native Compose app for arm64-v8a on API 26 and later. Gradle cross-compiles the workspace bridge with NDK 28.2.13676358 and generates Kotlin bindings from the resulting library's UniFFI metadata. The single typed call, `coreInfo()`, returns the Rust core version and the existing LAN peer wire version. The Android target excludes Linux Unix IPC, Secret Service, and clipboard backends. Pairing, networking, clipboard access, and background services remain outside this Android checkpoint.
+
+The CachyOS development host initially had JDK 27 and Rust 1.99.1 for Linux. The SDK, NDK, Gradle, ADB, and Rust Android target were absent. Verification used a temporary JDK 21 and Android SDK, the checked-in Gradle wrapper, and the per-user `aarch64-linux-android` Rust target. See the setup guide for exact installation, APK, and ADB commands. [Android development guide](../apps/android/README.md)
+
+```sh
+cargo check --locked -p lyteboard-android --target aarch64-linux-android
+cargo tree --locked -p lyteboard-android --target aarch64-linux-android
+apps/android/gradlew -p apps/android :app:assembleDebug :app:lintDebug
+cargo fmt --all -- --check
+cargo clippy --locked -p lyteboard-android -p lyteboard-protocol --all-targets --features lyteboard-android/bindgen -- -D warnings
+cargo test --locked --workspace
+git diff --check
+```
+
+The arm64 Rust check and focused Clippy passed. The Android dependency tree excluded Secret Service, Wayland clipboard, and X11. All 85 Linux workspace tests passed with the real filesystem and loopback access needed by the existing IPC tests.
+
+The debug APK built and passed `zipalign -c -P 16 4`. The packaged Rust and JNA ELF segments also use 16 KiB alignment. Android lint reported zero errors and eight warnings covering dependency updates, the arm64-only target, launcher icon, and backup configuration. A standalone Kotlin/JVM test loaded the host build of the same UniFFI bridge. On an Android 16 Google APIs emulator, ADB forced the arm64-v8a APK and reported `primaryCpuAbi=arm64-v8a`. The launched Compose screen displayed `Rust core 0.1.0` and `LAN protocol 1` through the ARM translation layer. No physical Android device was connected.
 
 ## Manual two-daemon demonstration
 

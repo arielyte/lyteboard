@@ -22,7 +22,8 @@ pub type NoiseKey = [u8; 32];
 pub type ChannelId = [u8; 16];
 pub type InviteId = [u8; 16];
 
-const VERSION: u8 = 1;
+/// Wire version used by LAN pairing and authenticated peer records.
+pub const VERSION: u8 = 1;
 pub const MAX_ENVELOPE_BYTES: usize = 36 * 1024;
 pub const MAX_CIPHERTEXT_BYTES: usize = 34 * 1024;
 pub const MAX_HANDSHAKE_BYTES: usize = 1024;

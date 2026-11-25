@@ -1,0 +1,27 @@
+[package]
+name = "lyteboard-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "lyteboard-uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+lyteboard-core.workspace = true
+lyteboard-protocol.workspace = true
+uniffi = { version = "=0.32.2", default-features = false }

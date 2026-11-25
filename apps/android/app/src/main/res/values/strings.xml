@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Lyteboard</string>
+    <string name="core_version">Rust core %1$s</string>
+    <string name="protocol_version">LAN protocol %1$d</string>
+</resources>
