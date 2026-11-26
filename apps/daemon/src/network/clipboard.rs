@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use lyteboard_core::{bulk::Payload, clipboard::Clipboard};
+use lyteboard_core::{
+    bulk::{Payload, clipboard_payload},
+    clipboard::Clipboard,
+};
 use lyteboard_protocol::{ipc::network::Reply, peer::Media};
 use tokio::{
     sync::watch,
@@ -87,11 +90,18 @@ impl AutoClipboard {
             while incoming.changed().await.is_ok() {
                 let payload = incoming.borrow_and_update().clone();
                 if let Some(payload) = payload {
-                    writes.remember(&payload);
-                    let result = clipboard
-                        .write_content(payload.media(), payload.bytes())
-                        .await;
-                    *status.borrow_mut() = result.err().map(|error| error.to_string());
+                    let error = match clipboard_payload(payload).await {
+                        Ok(prepared) => {
+                            writes.remember(&prepared);
+                            clipboard
+                                .write_content(prepared.media(), prepared.bytes())
+                                .await
+                                .err()
+                                .map(|error| error.to_string())
+                        }
+                        Err(error) => Some(error.to_string()),
+                    };
+                    *status.borrow_mut() = error;
                 }
             }
         });

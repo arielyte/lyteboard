@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use lyteboard_core::{
@@ -11,7 +11,7 @@ use lyteboard_core::{
 };
 use lyteboard_protocol::peer::{LanInvite, NoiseKey, validate_lan_address};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
@@ -112,6 +112,15 @@ pub struct Received {
 }
 
 #[derive(uniffi::Record)]
+pub struct HistoryItem {
+    pub device_id: String,
+    pub kind: Kind,
+    pub sent: bool,
+    pub timestamp: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(uniffi::Record)]
 pub struct Snapshot {
     pub id: String,
     pub devices: Vec<Device>,
@@ -144,7 +153,10 @@ struct Model {
     pair: Option<PairJob>,
     peers: BTreeMap<NoiseKey, Peer>,
     hints: BTreeMap<NoiseKey, (SocketAddr, Instant)>,
-    latest: Option<(u64, NoiseKey, Payload)>,
+    latest: Option<(u64, NoiseKey, Arc<Payload>)>,
+    collect_history: bool,
+    history_bytes: usize,
+    history: VecDeque<(NoiseKey, bool, u64, Arc<Payload>)>,
     send_status: String,
     sending: Option<NoiseKey>,
 }
@@ -160,6 +172,7 @@ struct Peer {
     task: JoinHandle<()>,
     state: Connection,
     sender: Option<mpsc::Sender<Job>>,
+    wake: Arc<Notify>,
 }
 
 struct Job {
@@ -283,6 +296,38 @@ impl Mobile {
         })
     }
 
+    pub fn set_history_enabled(&self, enabled: bool) {
+        let mut model = self.engine.model();
+        model.collect_history = enabled;
+        if !enabled {
+            model.history.clear();
+            model.history_bytes = 0;
+        }
+    }
+
+    pub fn next_history_item(&self) -> Option<HistoryItem> {
+        let mut model = self.engine.model();
+        let (key, sent, timestamp, payload) = model.history.pop_front()?;
+        model.history_bytes -= payload.bytes().len();
+        Some(HistoryItem {
+            device_id: hex::encode(key),
+            kind: payload.media().into(),
+            sent,
+            timestamp,
+            bytes: payload.bytes().to_vec(),
+        })
+    }
+
+    /// The OS reported a change to the local network. Old discovery hints and sockets
+    /// may belong to a different interface. Retain the authenticated device registry.
+    pub fn network_changed(&self) {
+        let mut model = self.engine.model();
+        if model.active {
+            model.invalidate_connections();
+            self.engine.schedule(self.handle(), &mut model);
+        }
+    }
+
     pub fn received_bytes(&self, sequence: u64) -> Result<Vec<u8>, MobileError> {
         self.engine
             .model()
@@ -345,7 +390,7 @@ impl Mobile {
     }
 
     /// A numeric socket address is always a hint. KK checks the already trusted pin.
-    pub fn connect(&self, device_id: String, address: String) -> Result<(), MobileError> {
+    pub fn connect(&self, device_id: String, address: String) -> Result<String, MobileError> {
         let peer = parse_pin(&device_id)?;
         let address = address
             .parse()
@@ -365,7 +410,7 @@ impl Mobile {
         model.remove_peer(peer);
         model.hints.insert(peer, (address, Instant::now()));
         self.engine.schedule(self.handle(), &mut model);
-        Ok(())
+        Ok(address.to_string())
     }
 
     pub fn discovery_hint(&self, device_id: String, address: String) {
@@ -374,7 +419,12 @@ impl Mobile {
         };
         let mut model = self.engine.model();
         if model.active && validate_lan_address(address).is_ok() && self.engine.is_trusted(peer) {
-            model.hints.insert(peer, (address, Instant::now()));
+            let previous = model.hints.insert(peer, (address, Instant::now()));
+            if previous.is_none_or(|(old, _)| old != address)
+                && let Some(connection) = model.peers.get(&peer)
+            {
+                connection.wake.notify_one();
+            }
         }
     }
 
@@ -460,12 +510,36 @@ impl Model {
     fn pause(&mut self) {
         self.active = false;
         self.cancel_pairing();
+        self.invalidate_connections();
+        self.send_status.clear();
+    }
+
+    fn invalidate_connections(&mut self) {
         for peer in std::mem::take(&mut self.peers).into_values() {
             peer.task.abort();
         }
         self.hints.clear();
-        self.sending = None;
-        self.send_status.clear();
+        if let Some(peer) = self.sending {
+            self.finish_send(peer, "Network changed before delivery was confirmed.");
+        }
+    }
+
+    fn record(&mut self, key: NoiseKey, sent: bool, payload: Arc<Payload>) {
+        if !self.collect_history {
+            return;
+        }
+        let size = payload.bytes().len();
+        while self.history.len() >= 32 || self.history_bytes + size > 20 * 1024 * 1024 {
+            if let Some((_, _, _, previous)) = self.history.pop_front() {
+                self.history_bytes -= previous.bytes().len();
+            }
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.history_bytes += size;
+        self.history.push_back((key, sent, timestamp, payload));
     }
 }
 
@@ -492,7 +566,9 @@ impl Engine {
             }
             let id = model.next();
             let engine = Arc::clone(self);
-            let task = runtime.spawn(async move { engine.reconnect(key, id).await });
+            let wake = Arc::new(Notify::new());
+            let signal = Arc::clone(&wake);
+            let task = runtime.spawn(async move { engine.reconnect(key, id, signal).await });
             model.peers.insert(
                 key,
                 Peer {
@@ -500,6 +576,7 @@ impl Engine {
                     task,
                     state: Connection::Offline,
                     sender: None,
+                    wake,
                 },
             );
         }
@@ -511,7 +588,12 @@ impl Engine {
         }
         let mut pending = lan::connect_pairing(&self.endpoint, invitation, &self.label)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| match error {
+                lan::Error::Io(_) | lan::Error::Timeout(_) => String::from(
+                    "Could not reach Linux. Check its LAN listener address and port, allow that TCP port through the firewall, and check for Wi-Fi client isolation.",
+                ),
+                _ => error.to_string(),
+            })?;
         let (approval, mut approved) = oneshot::channel();
         {
             let mut model = self.model();
@@ -549,7 +631,7 @@ impl Engine {
         }
     }
 
-    async fn reconnect(&self, key: NoiseKey, id: u64) {
+    async fn reconnect(&self, key: NoiseKey, id: u64, wake: Arc<Notify>) {
         let mut delay = Duration::from_secs(1);
         let mut use_saved = false;
         loop {
@@ -595,8 +677,13 @@ impl Engine {
             if !self.state(key, id, Connection::Offline, None) {
                 return;
             }
-            sleep(delay).await;
-            delay = (delay * 2).min(RETRY_MAX);
+            tokio::select! {
+                _ = sleep(delay) => delay = (delay * 2).min(RETRY_MAX),
+                _ = wake.notified() => {
+                    use_saved = false;
+                    delay = Duration::from_secs(1);
+                }
+            }
         }
     }
 
@@ -625,8 +712,16 @@ impl Engine {
             return false;
         }
         let sequence = model.next();
-        model.latest = Some((sequence, key, payload));
+        let payload = Arc::new(payload);
+        model.latest = Some((sequence, key, Arc::clone(&payload)));
+        model.record(key, false, payload);
         true
+    }
+
+    fn delivered(&self, key: NoiseKey, payload: Payload) {
+        let mut model = self.model();
+        model.record(key, true, Arc::new(payload));
+        model.finish_send(key, "Delivered.");
     }
 }
 

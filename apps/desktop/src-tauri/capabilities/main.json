@@ -27,6 +27,8 @@
     "allow-history-page",
     "allow-history-preview",
     "allow-restore-history",
+    "allow-latest-received",
+    "allow-copy-received",
     "allow-resend-history",
     "allow-delete-history",
     "allow-clear-history",

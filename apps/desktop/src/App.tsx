@@ -9,6 +9,7 @@ import {
   type DevicesView,
   type DesktopConfiguration,
   type DesktopNotice,
+  type ReceivedItem,
 } from "./api";
 import { DiscoverDevices, ManageDevice } from "./DeviceDialogs";
 import { History } from "./History";
@@ -28,6 +29,8 @@ export type Connection =
       state: "connected";
       daemon: DaemonStatus;
       network?: DevicesView;
+      received?: ReceivedItem | null;
+      receivedError?: string;
       error?: string;
     };
 type Notice = { message: string; error?: boolean; details?: string[] };
@@ -51,6 +54,7 @@ export function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [modal, setModal] = useState<Modal | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const [copying, setCopying] = useState(false);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [desktop, setDesktop] = useState<DesktopConfiguration>();
@@ -77,11 +81,20 @@ export function App() {
     try {
       const daemon = await api.daemon();
       if (daemon?.running) {
-        try {
-          next = { state: "connected", daemon, network: await api.devices() };
-        } catch (error) {
-          next = { state: "connected", daemon, error: errorMessage(error) };
-        }
+        const [network, received] = await Promise.allSettled([
+          api.devices(),
+          api.latestReceived(),
+        ]);
+        next = {
+          state: "connected",
+          daemon,
+          ...(network.status === "fulfilled"
+            ? { network: network.value }
+            : { error: errorMessage(network.reason) }),
+          ...(received.status === "fulfilled"
+            ? { received: received.value }
+            : { receivedError: errorMessage(received.reason) }),
+        };
       } else {
         next = { state: "offline" };
       }
@@ -110,11 +123,7 @@ export function App() {
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
     const visibleRefresh = () => {
-      if (
-        document.visibilityState === "visible" &&
-        document.hasFocus() &&
-        !pending.current
-      ) {
+      if (document.visibilityState === "visible" && !pending.current) {
         if (dirty.current) {
           dirty.current = false;
           setViewEpoch((value) => value + 1);
@@ -218,6 +227,22 @@ export function App() {
   const deviceList = network?.devices ?? [];
   const online = deviceList.filter((device) => device.state === "online");
   const connected = connection.state === "connected";
+
+  const received = connected ? connection.received : null;
+  const receivedError = connected ? connection.receivedError : null;
+
+  async function copyReceived(id: string) {
+    setCopying(true);
+    try {
+      await api.copyReceived(id);
+      setNotice({ message: "Received content copied to the clipboard." });
+    } catch (error) {
+      setNotice({ message: errorMessage(error), error: true });
+      void refresh();
+    } finally {
+      setCopying(false);
+    }
+  }
 
   async function send(recipients: string[]) {
     const names = new Map(deviceList.map(({ id, name }) => [id, name]));
@@ -373,6 +398,42 @@ export function App() {
               </ul>
             )}
           </div>
+        )}
+
+        {receivedError && page === "Devices" && (
+          <p className="message danger" role="alert">
+            {receivedError}
+          </p>
+        )}
+        {received && (
+          <section
+            className="setting-group setting-line"
+            aria-label="Latest received clipboard"
+          >
+            <div aria-live="polite">
+              <strong key={received.id}>
+                {received.media === "text"
+                  ? "Received text"
+                  : `Received ${received.media.toUpperCase()} image`}
+                {" from "}
+                {deviceList.find((device) => device.id === received.peer)
+                  ?.name ?? "a paired device"}
+              </strong>
+              <p className="muted">
+                {received.size.toLocaleString()} bytes · Latest incoming
+                transfer
+              </p>
+            </div>
+            <div className="row-actions">
+              <button
+                disabled={copying}
+                type="button"
+                onClick={() => void copyReceived(received.id)}
+              >
+                {copying ? "Copying…" : "Copy received content"}
+              </button>
+            </div>
+          </section>
         )}
 
         {page === "Devices" && (

@@ -168,6 +168,7 @@ async fn handle(
         }
         Ok(Ok(Request::Network(
             command @ (Command::BulkDownload { .. }
+            | Command::BulkDownloadReceived { .. }
             | Command::History(HistoryCommand::Restore { .. })),
         ))) => {
             let Ok(_slot) = bulk_slots.try_acquire_owned() else {
@@ -179,13 +180,21 @@ async fn handle(
             let _ = timeout(BULK_TIMEOUT, async {
                 let result = match command {
                     Command::BulkDownload { offset } => network.download(offset).await,
+                    Command::BulkDownloadReceived { id } => network.download_received(id).await,
                     Command::History(HistoryCommand::Restore { id }) => history
                         .load(id)
                         .await
                         .map(|payload| Some(Arc::new(payload))),
                     _ => unreachable!(),
                 };
-                let (reply, item) = match result {
+                let prepared = match result {
+                    Ok(Some(item)) => lyteboard_core::bulk::clipboard_payload(item)
+                        .await
+                        .map(Some)
+                        .map_err(|error| error.to_string()),
+                    other => other,
+                };
+                let (reply, item) = match prepared {
                     Ok(Some(item)) => {
                         network.mark_clipboard_write(&item);
                         (

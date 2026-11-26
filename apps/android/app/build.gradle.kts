@@ -26,6 +26,16 @@ android {
         ndk.abiFilters += "arm64-v8a"
     }
 
+    signingConfigs.named("debug") {
+        val override = providers.gradleProperty("lyteboardDebugKeystore")
+        val homeKeystore = File(System.getProperty("user.home"), ".android/debug.keystore")
+        storeFile = override.orNull?.let { File(it).also { path ->
+            require(path.isAbsolute && path.isFile) {
+                "lyteboardDebugKeystore must point to an existing absolute debug keystore path."
+            }
+        } } ?: homeKeystore
+    }
+
     buildFeatures { compose = true }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -44,6 +54,10 @@ kotlin {
 dependencies {
     implementation("androidx.activity:activity-compose:1.11.0")
     implementation("androidx.compose.material3:material3:1.4.0")
+    implementation("androidx.camera:camera-camera2:1.5.3")
+    implementation("androidx.camera:camera-lifecycle:1.5.3")
+    implementation("androidx.camera:camera-view:1.5.3")
+    implementation("com.google.zxing:core:3.5.4")
     implementation("net.java.dev.jna:jna:5.18.1@aar")
 }
 

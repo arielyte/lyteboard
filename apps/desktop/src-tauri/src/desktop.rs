@@ -551,6 +551,44 @@ pub(crate) async fn history_preview(id: i64) -> Result<PreviewView> {
     }
 }
 
+#[derive(Serialize)]
+pub(crate) struct ReceivedView {
+    id: String,
+    peer: String,
+    media: lyteboard_protocol::peer::Media,
+    size: u32,
+}
+
+#[tauri::command]
+pub(crate) async fn latest_received() -> Result<Option<ReceivedView>> {
+    let Reply::LatestReceived(item) = request(&client()?, Command::LatestReceived).await? else {
+        return Err(unexpected());
+    };
+    Ok(item.map(|item| ReceivedView {
+        id: hex::encode(item.id),
+        peer: hex::encode(item.peer),
+        media: item.media,
+        size: item.size,
+    }))
+}
+
+#[tauri::command]
+pub(crate) async fn copy_received(id: String) -> Result<()> {
+    let mut key = [0; 16];
+    hex::decode_to_slice(&id, &mut key).map_err(|_| "Invalid received item ID.")?;
+    let clipboard =
+        lyteboard_core::clipboard::Clipboard::for_session().map_err(|error| error.to_string())?;
+    let (media, bytes) = client()?
+        .download_received(key)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("This item is no longer in the daemon’s recent clipboard buffer.")?;
+    clipboard
+        .write_content(media, &bytes)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub(crate) async fn restore_history(id: i64) -> Result<()> {
     #[cfg(target_os = "linux")]

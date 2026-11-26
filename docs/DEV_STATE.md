@@ -1,6 +1,6 @@
 # Lyteboard development handoff
 
-Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. Text and images, multiple peers, automatic reconnection, and local history remain the product scope. The Kotlin Android app pairs with Linux and exchanges test text and images. Android clipboard sharing and Windows support are future work.
+Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. The Kotlin Android companion pairs with Linux and shares foreground clipboard content, text, and images. Windows support is future work.
 
 ## LAN-1 checkpoint
 
@@ -34,7 +34,7 @@ LAN-4A used inline authenticated delivery and the 4 KiB IPC framing, with a 512-
 
 ## LAN-4B checkpoint
 
-The Linux CLI shares up to 1 MiB of UTF-8 text and up to 10 MiB of static PNG, JPEG, or WebP. Clipboard sends choose a supported image target when present. Clipboard copy restores the received MIME type. Auto-apply stays off by default and applies text only when enabled. Clipboard writes never send data back to a peer.
+The Linux CLI shares up to 1 MiB of UTF-8 text and up to 10 MiB of static PNG, JPEG, or WebP. Clipboard sends choose a supported image target when present. At LAN-4B the copy command published the received MIME type and auto-apply supported text. See LAN-6E for current clipboard image formats.
 
 Bulk records travel in independently encrypted Noise sessions with a random ID per recipient, 32 KiB chunks, authenticated credits, SHA-256 verification, and an authenticated acknowledgment after validation and acceptance. Image validation checks the declared format, container length or end marker, decoder output, and dimensions. Images are limited to 8,192 pixels on either axis, 16 million pixels total, and 64 MiB decoded output. [Image decoder documentation](https://docs.rs/image/0.25.10/image/codecs/)
 
@@ -329,9 +329,113 @@ cargo test --locked --workspace
 git diff --check
 ```
 
-The test uses an Android 16 Google APIs emulator running the arm64-v8a APK through Android's ARM native bridge and two separate Linux daemons. Linux listeners use host loopback and the harness maps the invitation IP to the emulator's `10.0.2.2` host alias. The host-side clipboard adapter is file-backed for byte comparisons. Physical Android devices and Android NSD multicast resolution across a Wi-Fi LAN remain unverified.
+The test used an Android 16 Google APIs emulator running the arm64-v8a APK through Android's ARM native bridge and two separate Linux daemons. Linux listeners used host loopback and the harness mapped the invitation IP to the emulator's `10.0.2.2` host alias. The host-side clipboard adapter was file-backed for byte comparisons. The LAN-6C checkpoint records the later physical Samsung result.
 
 The emulator test passed pairing with both Linux peers, bidirectional chunked Unicode and PNG/JPEG/WebP with integrity checks, a manual listener-port change, identity and trust across process restarts, foreground disconnect and reconnect, and persistent revocation. The app and instrumentation APKs assembled successfully. The app APK passed 16 KiB ZIP alignment and Android lint reported zero errors and seven advisory warnings. All 85 Rust workspace tests passed, along with focused Clippy, formatting, and diff checks.
+
+## LAN-6C checkpoint
+
+Android has Devices, History, and Settings screens using the desktop palette and Noto Sans. Pairing starts with a native CameraX QR scan or a pasted Linux invitation. Both devices still compare and approve the Noise transcript code. On Android, **Send clipboard**, **Write text**, **Choose image**, and the system **Share → Lyteboard** action open a recipient picker. Transfers to multiple recipients use individually authenticated sessions and report confirmed deliveries. Received text and images support preview, copy, save, and resend. Text remains limited to 1 MiB and PNG, JPEG, and WebP to 10 MiB.
+
+Local history is opt-in and stored in private SQLite outside Android backup. It records successful sent and received content. Defaults are 100 entries, 100 MiB of payload data, and 7 days. Retention is configurable, and the app supports single-item deletion and confirmed clearing. Saved history is unencrypted at rest. Turning history off pauses recording. Android clipboard reads are foreground and user-initiated, and the app cancels sends and closes sessions when the activity stops.
+
+Android 14 and later subscribe to changes in resolved NSD services during foreground discovery. Earlier releases use Android's one-shot resolver as services appear. Resolved addresses wake reconnect attempts for trusted devices. Local Wi-Fi or Ethernet address changes invalidate sessions and stale discovery hints. Manual addresses are available in Settings. Rust still checks the paired Noise pin on every connection and retains the same LAN wire format and Keystore-protected identity.
+
+The user verified physical Samsung-to-Linux pairing and text sharing over Wi-Fi. The initial timeout cleared when UFW allowed the actual Linux TCP listener port. Use `lyteboard network status`, confirm the listener is on a LAN IP, and limit the UFW rule to the actual port and local subnet. Check Wi-Fi client isolation if both devices still cannot connect. [Android pairing, firewall commands, and test instructions](../apps/android/README.md)
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+apps/android/gradlew -p apps/android :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
+PYTHONDONTWRITEBYTECODE=1 python3 apps/android/tests/lan_emulator.py emulator-5562
+cargo clippy --locked -p lyteboard-android --target aarch64-linux-android -- -D warnings
+cargo test --locked --workspace
+cargo fmt --all -- --check
+git diff --check
+```
+
+The Android 16 emulator resolved a locally registered Android NSD advertisement. The cross-platform harness verified reconnecting to a trusted Linux daemon on a changed port using a new hint, foreground shutdown and reconnect, and persistent revocation. It also verified bidirectional Unicode and PNG/JPEG/WebP with integrity checks, an Android text share intent, and copying received text to the Android clipboard and sharing it to two Linux devices. Focused Android tests covered QR decoding and history storage, including age, item count, byte retention, reopening, and deletion. Android build, lint, and 16 KiB APK alignment passed. Lint reported zero errors and 13 advisory warnings. All 85 Rust workspace tests passed, along with arm64 Clippy, formatting, and diff checks.
+
+The emulator's injected camera feed produced a black or cropped preview across live scan attempts. Synthetic frame decoding and manual invitation pairing passed. End-to-end camera pairing and Android NSD on physical Wi-Fi remain unverified for this APK. The physical Samsung pairing and text result above predates these interface changes.
+
+### Linux automatic JPEG application investigation
+
+**Closed after physical verification.** With automatic application enabled, the user sent three different JPEGs from Samsung Android to CachyOS KDE Wayland. Preparing the paste command before each send yielded `1623693`, `79307`, and `1573118` bytes. The original failure did not recur under this controlled procedure. No implementation defect was demonstrated. The Linux clipboard implementation stays intact, and the JPEG/WebP regression tests and MIME-only observer are retained.
+
+On the physical Samsung transfer, `wl-paste --list-types` showed `image/jpeg` and `x-kde-passwordManagerHint` after automatic application. The separate `wl-paste --type image/jpeg` call promptly reported `Clipboard content is not available as requested type "image/jpeg"` and left an empty file. The user ran `cargo run -q -p lyteboard-cli -- clipboard copy` and then retrieved a valid 573×761 JPEG with the same two targets advertised. This verifies the Android transfer, Linux reception and retention, and manual restore for that image.
+
+Automatic application uses the daemon's graphical environment and a serial worker that can coalesce queued writes. Manual application runs in the CLI's graphical environment and reads the retained entry over local IPC. Both call the same Linux writer with `wl-copy --type image/jpeg --sensitive`. The sensitivity target is expected on both paths. At inspection the live daemon used the same Wayland socket and system `wl-copy` as the terminal, reported automatic application on with no recorded writer error, and had automatic sending off. Lyteboard's Wayland watcher skips offers with the sensitivity target before requesting their data.
+
+Ordinary automatic and manual application of a synthetic 573×761 JPEG passed in isolated KWin and in isolated Plasma with Klipper, including runs with Lyteboard automatic sending enabled on the receiver. A deliberately undrained Wayland data request made the next reader time out for both the automatic and manual owners despite both MIME types still being listed. The reported physical failure returned promptly with a different error. In wl-clipboard 2.3.0, that error means the paste process saw an offer and found no matching JPEG MIME type, before issuing any data request. Replacing a JPEG selection with a text offer between the two commands reproduced the exact error and exit status 1 in isolated KWin. The reason the physical paste process saw a different offer remains unknown. [wl-paste 2.3.0 offer selection](https://github.com/bugaevc/wl-clipboard/blob/v2.3.0/src/wl-paste.c#L1654)
+
+During the live retest, the physical Plasma session published two consecutive offers with JPEG and the sensitivity marker. A text offer with no JPEG followed about seven seconds after the second offer. This confirms a selection change in the live session. The way to control for copying commands is to enter the paste command in the terminal before the phone sends and execute it without copying anything in between.
+
+Start a MIME-only capture in the Linux graphical session before sending the test image. It reports timestamped selection changes and a fixed set of format flags. It requests zero clipboard payloads and does not report the source process.
+
+```bash
+cargo build --locked -p lyteboard-core --example clipboard_offers
+timeout 30s target/debug/examples/clipboard_offers
+```
+
+Run these in a second terminal while the failure is present. They report status, MIME types, process state, and a byte count without printing clipboard contents.
+
+```bash
+lyteboard clipboard auto
+timeout 4s wl-paste --list-types
+ps -C wl-copy,cat -o pid,ppid,stat,wchan:24,comm
+timeout 4s wl-paste --type image/jpeg | wc -c
+printf 'wl-paste status %s\n' "${PIPESTATUS[0]}"
+```
+
+A paste status of 124 indicates a timeout. A status of 1 with the quoted MIME error points to the offer visible to that paste process. Run manual restore after the capture. The clipboard harness checks automatic JPEG and WebP application immediately and after a delay, and compares the bytes with manual restore.
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin --x11
+```
+
+## LAN-6D checkpoint
+
+On Linux, **Settings → Automatically apply received content** controls the daemon preference for both text and images. It is off on a new profile. The GUI shows the latest received item with its sender, type, size, and **Copy received content** action. The displayed item ID selects the same payload even when a newer transfer arrives. If it has been evicted or the daemon has restarted, the action reports that it is unavailable. The desktop refreshes on focus and every five seconds while visible. Update and restart the desktop and daemon together to enable the new IPC operations.
+
+Incoming items use the daemon's existing in-memory buffer of at most 16 items and 20 MiB combined. The GUI gets metadata through the 4 KiB IPC control frame and copies through the existing bounded bulk channel. The payload stays out of the webview. Lyteboard writes durable history only when it is enabled. Explicit clipboard copies and automatic application publish content to the system clipboard, which the compositor or another clipboard manager can handle independently.
+
+Android's debug configuration uses a stable per-user keystore path. Developers can select an existing standard debug key with the private `lyteboardDebugKeystore` Gradle property to preserve an installed app's identity during upgrades. The setup guide records signing, the actual TCP listener port required by UFW, and why the paste test command must be prepared before receiving an image. [Android guide](../apps/android/README.md)
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+cargo test --locked -p lyteboard-daemon -p lyteboard-core -p lyteboard-protocol -p lyteboard-desktop
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin
+npm --prefix apps/desktop run lint
+npm --prefix apps/desktop run format:check
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+cargo build --locked --release -p lyteboard-daemon
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py
+apps/android/gradlew -p apps/android :app:assembleDebug :app:assembleDebugAndroidTest :app:lintDebug
+git diff --check
+```
+
+All 86 affected Rust tests passed, along with focused Clippy, formatting, and diff checks. The KWin CLI harness exercised the 4 KiB metadata response and copied the original item by ID after a newer arrival. The full native Tauri suite verified incoming feedback, manual copy, and the automatic application toggle with history disabled, including the absence of a history database. Frontend lint, formatting, typecheck, and the release Tauri build passed. Android debug and instrumentation APKs assembled. Android lint completed with zero errors and 13 advisory warnings. Two separately packaged debug APKs had matching signing certificate fingerprints across different Android user homes when pointed at the same existing local debug key.
+
+## LAN-6E checkpoint
+
+On the physical Samsung-to-CachyOS KDE Wayland test, automatic and manual application published a JPEG that `wl-paste` retrieved in full at 79,307 bytes. The user's applications rejected direct JPEG paste. Publishing the same image as PNG allowed the user to paste it into ChatGPT.
+
+On Linux, automatic application, **Copy received content**, CLI clipboard copy, and history restore now publish `image/png` for incoming images. The existing Rust `image` decoders convert JPEG and WebP. Validated PNG bytes pass through. Noise transfers, the receive buffer, saved history entries, and history resend retain the original MIME and bytes. The daemon uses the existing 8,192-pixel axis limit, 16 million pixels, and 64 MiB decoded-image limit, with one validation or conversion in progress and a 10 MiB PNG output limit. Conversion failure leaves the clipboard alone and is reported by manual copy or automatic application status.
+
+The existing Wayland sensitivity hint remains enabled. The daemon remembers the actual PNG fingerprint before publication for echo suppression, including on X11. Native Xorg is outside the graphical regression runs.
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+cargo test --locked -p lyteboard-core --lib bulk::
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin --qt-paste
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin --x11 --qt-paste
+git diff --check
+```
+
+All 87 workspace tests and focused Clippy passed. The simulated clipboard harness and the KWin Wayland and XWayland runs passed. The optional PyQt6 check pasted PNG, JPEG-derived PNG, and WebP-derived PNG into an image-capable Qt rich-text editor and checked the inserted image dimensions. The harness also verified byte-for-byte original JPEG and WebP history and resending, history restore as PNG, and suppression of an XWayland echo. A separate synthetic oversized conversion produced an explicit error on both automatic and manual application and preserved the previous clipboard and retained JPEG. The updated build was not retested in ChatGPT.
 
 ## Manual two-daemon demonstration
 
@@ -492,7 +596,7 @@ lyteboard clipboard copy
 wl-paste --no-newline --type image/png | sha256sum
 ```
 
-On X11 substitute `xclip -selection clipboard -in -target image/png -silent < sample.png` and `xclip -selection clipboard -out -target image/png | sha256sum`. Compare the receiver's hash with `sha256sum sample.png` on the sender. JPEG and WebP use `image/jpeg` and `image/webp` respectively.
+On X11 substitute `xclip -selection clipboard -in -target image/png -silent < sample.png` and `xclip -selection clipboard -out -target image/png | sha256sum`. For PNG input, compare the receiver's hash with `sha256sum sample.png` on the sender. For JPEG or WebP, use the matching MIME type on the sender and read `image/png` on the Linux receiver. The PNG hash differs because the local clipboard view has a different encoding.
 
 ## Verification
 

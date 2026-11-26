@@ -437,6 +437,10 @@ function SavedPreferences({
                 }}
               />
             </label>
+            <p className="muted">
+              Incoming text and images replace your local clipboard when
+              enabled.
+            </p>
             {!clipboard.paused &&
               clipboard.apply &&
               !clipboard.apply_active && (

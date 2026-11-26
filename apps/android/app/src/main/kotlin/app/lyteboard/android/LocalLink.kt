@@ -6,7 +6,6 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Handler
 import android.os.Looper
 import app.lyteboard.core.LanAccess
-import app.lyteboard.core.Mobile
 import app.lyteboard.core.coreInfo
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -50,23 +49,34 @@ internal class LocalLink : LanAccess {
 }
 
 @Suppress("DEPRECATION") // Legacy NSD resolution is available down to API 26.
-internal class Discovery(context: Context, private val mobile: Mobile) : AutoCloseable {
+internal class Discovery(context: Context, private val onHint: (String, String) -> Unit) : AutoCloseable {
     private val nsd = context.getSystemService(NsdManager::class.java)
     private val handler = Handler(Looper.getMainLooper())
+    private val localLink = LocalLink()
     private val wireVersion = coreInfo().protocolVersion.toString()
     private val pending = ArrayDeque<NsdServiceInfo>()
     private var started = false
     private var resolving = false
+    private val monitor = if (android.os.Build.VERSION.SDK_INT >= 34)
+        ServiceMonitor(nsd, context, ::publish) else null
 
     private val listener = object : NsdManager.DiscoveryListener {
         override fun onDiscoveryStarted(type: String) = Unit
         override fun onDiscoveryStopped(type: String) = Unit
         override fun onStartDiscoveryFailed(type: String, code: Int) = close()
         override fun onStopDiscoveryFailed(type: String, code: Int) = Unit
-        override fun onServiceLost(service: NsdServiceInfo) = Unit
+        override fun onServiceLost(service: NsdServiceInfo) {
+            handler.post {
+                if (android.os.Build.VERSION.SDK_INT >= 34) monitor?.remove(service)
+            }
+        }
+
         override fun onServiceFound(service: NsdServiceInfo) {
             handler.post {
-                if (started && pending.size < 16) {
+                if (!started || !service.serviceName.startsWith("lyteboard-")) return@post
+                if (android.os.Build.VERSION.SDK_INT >= 34) {
+                    monitor?.track(service)
+                } else if (pending.size < 16) {
                     pending.addLast(service)
                     resolveNext()
                 }
@@ -95,18 +105,24 @@ internal class Discovery(context: Context, private val mobile: Mobile) : AutoClo
         handler.post {
             resolving = false
             if (!started) return@post
-            if (service != null && service.attributes["v"]?.decodeToString() == wireVersion) {
-                val pin = service.attributes["id"]?.decodeToString()
-                val ip = service.host?.hostAddress
-                if (pin != null && pin.length == 64 && ip != null && service.port in 1..65535 &&
-                    service.serviceName.equals("lyteboard-${pin.take(16)}", ignoreCase = true)
-                ) {
-                    val hint = if (ip.contains(':')) "[$ip]:${service.port}" else "$ip:${service.port}"
-                    mobile.discoveryHint(pin, hint)
-                }
-            }
+            service?.let(::publish)
             resolveNext()
         }
+    }
+
+    private fun publish(service: NsdServiceInfo) {
+        if (!started || service.attributes["v"]?.decodeToString() != wireVersion) return
+        val pin = service.attributes["id"]?.decodeToString() ?: return
+        if (pin.length != 64 || service.port !in 1..65535 ||
+            !service.serviceName.equals("lyteboard-${pin.take(16)}", ignoreCase = true)
+        ) return
+        val hosts = if (android.os.Build.VERSION.SDK_INT >= 34) service.hostAddresses
+            else listOfNotNull(service.host)
+        val address = hosts.sortedBy { it.address.size }.firstOrNull { host ->
+            host.hostAddress?.let { localLink.isOnLink(it) } == true
+        }?.hostAddress ?: return
+        val hint = if (':' in address) "[$address]:${service.port}" else "$address:${service.port}"
+        onHint(pin, hint)
     }
 
     override fun close() {
@@ -118,6 +134,101 @@ internal class Discovery(context: Context, private val mobile: Mobile) : AutoClo
         if (!started) return
         started = false
         pending.clear()
+        if (android.os.Build.VERSION.SDK_INT >= 34) monitor?.close()
         runCatching { nsd.stopServiceDiscovery(listener) }
+    }
+}
+
+@androidx.annotation.RequiresApi(34)
+private class ServiceMonitor(
+    private val nsd: NsdManager,
+    context: Context,
+    private val found: (NsdServiceInfo) -> Unit,
+) {
+    private val main = androidx.core.content.ContextCompat.getMainExecutor(context)
+    private val subscriptions = mutableMapOf<Pair<String, android.net.Network?>, NsdManager.ServiceInfoCallback>()
+
+    fun track(service: NsdServiceInfo) {
+        val key = service.serviceName to service.network
+        if (key in subscriptions || subscriptions.size >= 32) return
+        val listener = object : NsdManager.ServiceInfoCallback {
+            override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                subscriptions.remove(key, this)
+            }
+
+            override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                if (subscriptions[key] === this) found(serviceInfo)
+            }
+
+            override fun onServiceLost() = Unit
+            override fun onServiceInfoCallbackUnregistered() {
+                subscriptions.remove(key, this)
+            }
+        }
+        subscriptions[key] = listener
+        runCatching { nsd.registerServiceInfoCallback(service, main, listener) }
+            .onFailure { subscriptions.remove(key, listener) }
+    }
+
+    fun remove(service: NsdServiceInfo) {
+        subscriptions.remove(service.serviceName to service.network)?.let {
+            runCatching { nsd.unregisterServiceInfoCallback(it) }
+        }
+    }
+
+    fun close() {
+        for (listener in subscriptions.values) runCatching { nsd.unregisterServiceInfoCallback(listener) }
+        subscriptions.clear()
+    }
+}
+
+/** Coalesce address and route changes while the activity is visible. */
+internal class LanChanges(context: Context, private val changed: () -> Unit) : AutoCloseable {
+    private val manager = context.getSystemService(android.net.ConnectivityManager::class.java)
+    private val handler = Handler(Looper.getMainLooper())
+    private val networks = mutableMapOf<android.net.Network, Set<String>>()
+    private var registered = false
+    private var initial = true
+    private val notifyChange = Runnable {
+        if (registered) changed()
+    }
+    private val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onLinkPropertiesChanged(network: android.net.Network, properties: android.net.LinkProperties) {
+            val links = properties.linkAddresses.map { it.toString() }.toSet()
+            handler.post {
+                if (!registered) return@post
+                val previous = networks.put(network, links)
+                if (links != previous) schedule()
+            }
+        }
+
+        override fun onLost(network: android.net.Network) {
+            handler.post {
+                if (registered && networks.remove(network) != null) schedule()
+            }
+        }
+    }
+
+    init {
+        val request = android.net.NetworkRequest.Builder()
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        registered = runCatching { manager.registerNetworkCallback(request, callback) }.isSuccess
+        handler.postDelayed({ initial = false }, 800)
+    }
+
+    private fun schedule() {
+        if (initial) return
+        handler.removeCallbacks(notifyChange)
+        handler.postDelayed(notifyChange, 500)
+    }
+
+    override fun close() {
+        handler.removeCallbacks(notifyChange)
+        if (registered) {
+            registered = false
+            manager.unregisterNetworkCallback(callback)
+        }
     }
 }

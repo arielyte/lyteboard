@@ -20,6 +20,9 @@ export type Device = {
 };
 export type DevicesView = { listener: Listener; devices: Device[] };
 export type NearbyDevice = { id: string; address: string; paired: boolean };
+export type ReceivedItem = Pick<HistoryEntry, "peer" | "media" | "size"> & {
+  id: string;
+};
 export type Delivery = { id: string; error: string | null };
 export type HistoryLimits = { entries: number; mib: number; days: number };
 export type HistoryConfiguration = {
@@ -111,6 +114,8 @@ export const api = {
   pairStatus: () => invoke<PairState>("pair_status"),
   confirmPair: (code: string) => invoke<void>("pair_confirm", { code }),
   cancelPair: () => invoke<void>("pair_cancel"),
+  latestReceived: () => invoke<ReceivedItem | null>("latest_received"),
+  copyReceived: (id: string) => invoke<void>("copy_received", { id }),
   clipboardPreferences: () =>
     invoke<ClipboardPreferences>("clipboard_preferences"),
   setClipboardPause: (paused: boolean) =>

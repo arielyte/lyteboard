@@ -51,6 +51,7 @@ enum Operation {
     Control(Command),
     Upload(Vec<NoiseKey>, Payload, OwnedSemaphorePermit),
     Download(usize),
+    DownloadReceived([u8; 16]),
 }
 
 enum Output {
@@ -108,6 +109,13 @@ impl Network {
 
     pub async fn download(&self, offset: usize) -> Result<Option<Arc<Payload>>, String> {
         match self.dispatch(Operation::Download(offset)).await? {
+            Output::Download(item) => Ok(item),
+            Output::Control(_) => unreachable!(),
+        }
+    }
+
+    pub async fn download_received(&self, id: [u8; 16]) -> Result<Option<Arc<Payload>>, String> {
+        match self.dispatch(Operation::DownloadReceived(id)).await? {
             Output::Download(item) => Ok(item),
             Output::Control(_) => unreachable!(),
         }
@@ -265,6 +273,7 @@ impl Worker {
                             Operation::Control(command) => Output::Control(self.command(command).await.unwrap_or_else(Reply::Error)),
                             Operation::Upload(peers, payload, _slot) => Output::Control(self.upload(peers, payload).await.unwrap_or_else(Reply::Error)),
                             Operation::Download(offset) => Output::Download(self.activity.borrow().inbox.payload(offset)),
+                            Operation::DownloadReceived(id) => Output::Download(self.activity.borrow().inbox.by_id(id)),
                         };
                         let _ = response.send(reply);
                     }
@@ -588,6 +597,9 @@ impl Worker {
         }
         match command {
             Command::ClipboardSync(command) => return self.clipboard_sync(command).await,
+            Command::LatestReceived => {
+                return Ok(Reply::LatestReceived(self.activity.borrow().inbox.latest()));
+            }
             Command::ClipboardPreferences => return self.clipboard_preferences(),
             Command::SetClipboardPaused { paused } => {
                 return self.set_clipboard_paused(paused).await;
@@ -608,6 +620,7 @@ impl Worker {
         let endpoint = self.ensure_ready().await?;
         match command {
             Command::Listen { .. }
+            | Command::LatestReceived
             | Command::ClipboardPreferences
             | Command::SetClipboardPaused { .. }
             | Command::ClipboardAutoStatus
@@ -754,9 +767,10 @@ impl Worker {
                 .sessions
                 .delivery(id)
                 .map(Reply::Delivery),
-            Command::BulkUpload { .. } | Command::BulkDownload { .. } | Command::History(_) => {
-                Err("Use the bulk stream.".into())
-            }
+            Command::BulkUpload { .. }
+            | Command::BulkDownload { .. }
+            | Command::BulkDownloadReceived { .. }
+            | Command::History(_) => Err("Use the bulk stream.".into()),
             Command::Received { offset } => Ok(Reply::Received(
                 self.activity.borrow().inbox.message(offset),
             )),

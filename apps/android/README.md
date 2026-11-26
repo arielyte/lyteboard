@@ -1,6 +1,6 @@
 # Lyteboard Android development
 
-The app supports arm64-v8a on Android API 26 and later. Gradle builds the Rust library using the NDK and generates Kotlin bindings from the library's UniFFI metadata. The Compose screen can pair with Linux, show connection state, and exchange test text and images.
+The app supports arm64-v8a on Android API 26 and later. Gradle builds the Rust library using the NDK and generates Kotlin bindings from the library's UniFFI metadata. Use **Devices** to pair and share, **History** to revisit saved transfers, and **Settings** for appearance, local history, and connection management.
 
 ## CachyOS setup
 
@@ -41,6 +41,16 @@ export PATH="$ANDROID_HOME/platform-tools:$PATH"
 
 Gradle 8.14.8 is downloaded and verified by the checked-in wrapper. Gradle resolves build dependencies from Google Maven, Maven Central, and the Gradle Plugin Portal. Cargo uses the workspace lockfile. The NDK build script targets a Linux x86_64 development host. [Gradle release checksums](https://gradle.org/release-checksums/), [Android Gradle Plugin 8.13 compatibility](https://developer.android.com/build/releases/agp-8-13-0-release-notes)
 
+### Keep the same debug signing key
+
+The debug build uses `~/.android/debug.keystore` even when `ANDROID_USER_HOME` changes. If the app on your phone was signed with a different local debug keystore, keep using that key. Set `lyteboardDebugKeystore=/absolute/path/to/debug.keystore` in your private `~/.gradle/gradle.properties`, or pass `-PlyteboardDebugKeystore=/absolute/path/to/debug.keystore` to Gradle. Keep the key outside the repository and temporary build directories.
+
+For a new setup with no existing key, build once with `ANDROID_USER_HOME` unset so Android Gradle can create the standard key in the default location. An in-place APK upgrade requires the same application ID and signing certificate. Compare APKs before upgrading if you have previously used different build profiles.
+
+```bash
+"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs app-debug.apk
+```
+
 ## Build and inspect the debug APK
 
 Run these commands from the repository root.
@@ -65,11 +75,11 @@ adb shell getprop ro.product.cpu.abilist
 adb install --abi arm64-v8a -r "$apk"
 adb shell am start -W -n app.lyteboard.android/.MainActivity
 adb shell uiautomator dump /sdcard/lyteboard-window.xml
-adb shell cat /sdcard/lyteboard-window.xml | grep -oE 'Rust core [^"]+|LAN protocol [^"]+'
+adb shell cat /sdcard/lyteboard-window.xml | grep -oE 'Pair device|Send clipboard|History|Settings'
 adb logcat -d -s AndroidRuntime:E
 ```
 
-The screen should show `Rust core 0.1.0` and `LAN protocol 1` at this checkpoint. Displaying both lines after launch exercises the native call. Use `adb uninstall app.lyteboard.android` to remove the development app.
+The **Devices** screen shows **Pair device** after the protected profile opens. Use the same signing key for an in-place upgrade so Android keeps the existing profile. Use `adb uninstall app.lyteboard.android` to remove the app and its local profile.
 
 On a CachyOS x86_64 host with KVM, the Android 16 Google APIs emulator can run the arm64 APK through Android's native bridge. Review any SDK license prompts before installing the image. [Android Emulator ARM support](https://developer.android.com/studio/releases/emulator)
 
@@ -83,7 +93,7 @@ On a CachyOS x86_64 host with KVM, the Android 16 Google APIs emulator can run t
 
 Run the ADB commands from a second shell with `ANDROID_SERIAL=emulator-5562` exported. Stop that emulator with `adb -s emulator-5562 emu kill`.
 
-## Pair and exchange test content
+## Pair and share with Linux
 
 On Linux, bind to the actual Wi-Fi or Ethernet IP on the same subnet as Android. Use an isolated Linux profile if testing revocation. Keep the invitation private until you paste it into Lyteboard.
 
@@ -91,8 +101,9 @@ On Linux, bind to the actual Wi-Fi or Ethernet IP on the same subnet as Android.
 lyteboard daemon start
 read -r -p 'Linux LAN IPv4 address: ' linux_ip
 lyteboard network listen "$linux_ip:47851"
-lyteboard pair invite
-# Paste the invitation into Android and tap Import invitation.
+lyteboard pair invite --qr
+# On Android, open Devices → Pair device → Scan QR code.
+# For manual entry, use lyteboard pair invite and paste the invitation.
 lyteboard pair status
 # Compare both screens, enter the Linux code on Android, and tap Approve.
 lyteboard pair confirm
@@ -105,9 +116,36 @@ lyteboard clipboard send "$android_id"
 sha256sum sample.png
 ```
 
-Use **View text** or **Save received item** on Android. Compare the displayed SHA-256 with the Linux hash. Select Linux in **Trusted devices**, then use **Send text** or **Send image**. For an Android image sent to Linux, run `lyteboard clipboard copy` and `wl-paste --no-newline --type image/png | sha256sum`. Use the matching MIME type for JPEG or WebP.
+On Android, open **Latest received → Preview** to copy, save, or resend the item. To compare image bytes, save the item and hash the saved file. Use **Send clipboard**, **Write text**, or **Choose image** and select one or more online recipients. From another Android app, use **Share → Lyteboard** for plain text, PNG, JPEG, or WebP, then approve delivery in Lyteboard. Clipboard reads happen when you tap **Send clipboard** while Lyteboard is in focus. On Linux, the daemon publishes received images as PNG for paste compatibility. JPEG and WebP retain their original format when sent or saved in Lyteboard history.
 
-Android initiates the session. Both peers can send once it is connected. Reopen the Android app to reconnect or select the device and enter a numeric IP and port. Android NSD provides address hints for already paired peers. Android's `INTERNET` manifest permission enables LAN sockets at target SDK 36. Dials are restricted to local interface subnets and verified against the stored Noise pin. [Android LAN permissions](https://developer.android.com/privacy-and-security/local-network-permission)
+Use **Save** for content too large for the system clipboard or when the destination app cannot paste an image. Android exposes copied images as temporary content URIs.
+
+History is off by default. **Settings → Local history** stores successful sends and receives privately on the phone. The contents are unencrypted at rest and excluded from backup. Defaults are 100 entries, 100 MiB of payload data, and 7 days. You can change those limits or delete items. Turning history off stops recording and keeps existing rows available when you enable it again. Use **Clear history** to delete them.
+
+Android initiates the session. Both peers can send once it is connected. Opening Lyteboard reconnects trusted devices. Android NSD provides address hints for already paired devices. If discovery is unavailable, open **Settings → Manage device connections** and enter the numeric IP and port from Linux. Dials are restricted to local interface subnets and verified against the stored Noise pin. [Android LAN permissions](https://developer.android.com/privacy-and-security/local-network-permission)
+
+### Troubleshoot a timeout
+
+A physical Samsung phone paired and shared text with Linux over Wi-Fi after opening the actual Lyteboard TCP listener port in UFW. On Linux, check `lyteboard network status` for the current listener. A loopback address such as `127.0.0.1` cannot accept the phone's connection. Set the listener to the machine's Wi-Fi or Ethernet address and generate a fresh invitation with the reachable address.
+
+If you administer the Linux firewall, allow that TCP port from your LAN subnet. Substitute the actual listener IP, port, and subnet. Also check that both devices are on the same LAN and that the access point's guest or client isolation permits communication. [UFW manual](https://manpages.ubuntu.com/manpages/noble/man8/ufw.8.html)
+
+```bash
+lyteboard network status
+read -r -p 'Linux listener IP: ' linux_ip
+read -r -p 'Actual Lyteboard TCP listener port: ' listener_port
+read -r -p 'Local subnet in CIDR notation: ' lan_subnet
+sudo ufw allow from "$lan_subnet" to "$linux_ip" port "$listener_port" proto tcp
+sudo ufw status numbered
+```
+
+Automatic discovery uses local multicast DNS on UDP 5353. If multicast is filtered, enter the Linux listener address manually. The transfer still needs the listener's TCP port.
+
+When checking automatic image application on KDE Wayland, type or paste the test command into the terminal **before** sending the image from Android. After the transfer, press Enter without copying anything on Linux. Copying the command after receipt can replace the image selection with text.
+
+```bash
+wl-paste --type image/png | wc -c
+```
 
 For automated verification, start a disposable API 36 emulator with empty Lyteboard app data and an `adb` executable on PATH. On Linux, install `dbus` and `gnome-keyring` if absent. From the repository root run:
 

@@ -1,6 +1,6 @@
 # Lyteboard
 
-Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Clipboard sharing is available on Linux. The Kotlin Android app can pair with Linux and exchange test text and images. Windows support is planned.
+Lyteboard is an open-source project for sharing text and images directly between devices on the same local network. The design uses authenticated QR pairing and Noise encryption and works without internet access. Linux supports clipboard synchronization. Android supports foreground clipboard sharing and the Android share sheet. Windows support is planned.
 
 The Linux desktop window and CLI use the same daemon to pair devices and share encrypted clipboard text and images. Paired devices reconnect using mDNS or a saved LAN address. The CLI also manages opt-in clipboard history and automatic synchronization. [Development state](docs/DEV_STATE.md)
 

@@ -24,6 +24,8 @@ fn main() {
         "history_page",
         "history_preview",
         "restore_history",
+        "latest_received",
+        "copy_received",
         "resend_history",
         "delete_history",
         "clear_history",

@@ -209,6 +209,27 @@ def history_and_preferences(window, alpha, beta, clip, args):
     window.wait_text("Local clipboard history is stored without encryption at rest.")
     assert not window.checked("Automatic sending")
     assert not window.checked("Automatically apply received content")
+    sender = beta.devices()["Alpha"][0]
+    wait_for(lambda: beta.online(sender))
+    window.page("Devices")
+    clip.seed(b"previous clipboard")
+    assert beta.cli("send", sender, "Incoming with history disabled") == "Delivered"
+    window.wait_text("Received text from Beta laptop")
+    assert clip.read() == b"previous clipboard"
+    window.click("Copy received content")
+    window.wait_text("Received content copied to the clipboard.")
+    assert clip.read() == b"Incoming with history disabled"
+    profile = Path(alpha.env["LYTEBOARD_PROFILE"])
+    assert not (profile / "history" / "history.sqlite3").exists()
+
+    window.page("Settings")
+    window.check("Automatically apply received content", True)
+    assert alpha.cli("clipboard", "auto") == "Automatic clipboard application on"
+    assert beta.cli("send", sender, "Automatically applied with history disabled") == "Delivered"
+    wait_for(lambda: clip.read() == b"Automatically applied with history disabled")
+    window.check("Automatically apply received content", False)
+    assert alpha.cli("clipboard", "auto") == "Automatic clipboard application off"
+    assert not (profile / "history" / "history.sqlite3").exists()
     window.check("Persistent clipboard history", True)
     window.wait_text("History enabled.")
     for label, value in (("Maximum entries", "25"), ("Maximum MiB", "12"), ("Maximum days", "3")):

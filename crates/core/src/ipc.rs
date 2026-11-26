@@ -119,6 +119,19 @@ impl Client {
     }
 
     #[cfg(target_os = "linux")]
+    pub async fn download_received(
+        &self,
+        id: lyteboard_protocol::peer::TransferId,
+    ) -> Result<Option<(lyteboard_protocol::peer::Media, zeroize::Zeroizing<Vec<u8>>)>, ClientError>
+    {
+        linux::download(
+            &self.endpoint,
+            network::Command::BulkDownloadReceived { id },
+        )
+        .await
+    }
+
+    #[cfg(target_os = "linux")]
     pub async fn download_history(
         &self,
         id: i64,

@@ -42,6 +42,12 @@ pub enum Error {
     Integrity,
     #[error("Payload validation failed.")]
     Validation,
+    #[cfg(target_os = "linux")]
+    #[error("The converted clipboard PNG exceeds the {0}-byte limit.")]
+    ClipboardPngLimit(usize),
+    #[cfg(target_os = "linux")]
+    #[error("Could not encode a compatible PNG for the clipboard.")]
+    ClipboardPngEncoding,
 }
 
 impl Error {
@@ -228,6 +234,88 @@ pub async fn thumbnail(
     .map_err(|_| Error::Validation)?
 }
 
+/// Prepare a separate local clipboard representation of a validated payload.
+#[cfg(target_os = "linux")]
+pub async fn clipboard_payload(
+    original: std::sync::Arc<Payload>,
+) -> Result<std::sync::Arc<Payload>, Error> {
+    if matches!(original.media(), Media::Text | Media::Png) {
+        return Ok(original);
+    }
+    let permit = VALIDATION.acquire().await.map_err(|_| Error::Validation)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let bytes = decode_image(
+            original.media(),
+            original.bytes(),
+            |color, width, height, pixels| {
+                encode_clipboard_png(color, width, height, pixels, Media::Png.limit())
+            },
+        )?;
+        Ok(std::sync::Arc::new(Payload {
+            media: Media::Png,
+            digest: Sha256::digest(&*bytes).into(),
+            bytes,
+        }))
+    })
+    .await
+    .map_err(|_| Error::Validation)?
+}
+
+#[cfg(target_os = "linux")]
+fn encode_clipboard_png(
+    color: ColorType,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    struct BoundedPng {
+        bytes: Zeroizing<Vec<u8>>,
+        limit: usize,
+        exceeded: bool,
+    }
+
+    impl std::io::Write for BoundedPng {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let required = self.bytes.len().saturating_add(bytes.len());
+            if required > self.limit {
+                self.exceeded = true;
+                return Err(std::io::Error::other("clipboard PNG exceeds its limit"));
+            }
+            if required > self.bytes.capacity() {
+                let capacity = (self.bytes.capacity() * 2).max(required).min(self.limit);
+                let additional = capacity - self.bytes.len();
+                self.bytes
+                    .try_reserve_exact(additional)
+                    .map_err(std::io::Error::other)?;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut output = BoundedPng {
+        bytes: Zeroizing::new(Vec::new()),
+        limit,
+        exceeded: false,
+    };
+    PngEncoder::new(&mut output)
+        .write_image(pixels, width, height, color.into())
+        .map_err(|_| {
+            if output.exceeded {
+                Error::ClipboardPngLimit(limit)
+            } else {
+                Error::ClipboardPngEncoding
+            }
+        })?;
+    Ok(output.bytes)
+}
+
 fn sample_thumbnail(
     color: ColorType,
     width: u32,
@@ -367,6 +455,47 @@ mod tests {
             .write_to(&mut output, format)
             .unwrap();
         output.into_inner()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clipboard_png_preserves_the_decoded_pixels_and_the_original_payload() {
+        for (media, format) in [
+            (Media::Png, ImageFormat::Png),
+            (Media::Jpeg, ImageFormat::Jpeg),
+            (Media::Webp, ImageFormat::WebP),
+        ] {
+            let pixels = image::RgbImage::from_fn(31, 17, |x, y| {
+                image::Rgb([x as u8 * 8, y as u8 * 8, (x + y) as u8 * 4])
+            });
+            let mut encoded = Cursor::new(Vec::new());
+            DynamicImage::ImageRgb8(pixels)
+                .write_to(&mut encoded, format)
+                .unwrap();
+            let encoded = encoded.into_inner();
+            let original = std::sync::Arc::new(
+                Payload::new(media, Zeroizing::new(encoded.clone()), None).unwrap(),
+            );
+            let clipboard = clipboard_payload(original.clone()).await.unwrap();
+            assert_eq!(original.media(), media);
+            assert_eq!(original.bytes(), encoded);
+            assert_eq!(clipboard.media(), Media::Png);
+            assert_eq!(
+                image::load_from_memory(clipboard.bytes())
+                    .unwrap()
+                    .to_rgba8(),
+                image::load_from_memory_with_format(&encoded, format)
+                    .unwrap()
+                    .to_rgba8(),
+            );
+            if media == Media::Png {
+                assert!(std::sync::Arc::ptr_eq(&original, &clipboard));
+            }
+        }
+        assert!(matches!(
+            encode_clipboard_png(ColorType::Rgb8, 1, 1, &[1, 2, 3], 8),
+            Err(Error::ClipboardPngLimit(8))
+        ));
     }
 
     #[test]

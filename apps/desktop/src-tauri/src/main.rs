@@ -61,6 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             history_page,
             history_preview,
             restore_history,
+            latest_received,
+            copy_received,
             resend_history,
             delete_history,
             clear_history,

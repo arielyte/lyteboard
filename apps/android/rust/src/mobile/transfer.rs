@@ -67,6 +67,7 @@ pub(super) async fn run(
                 let payload = match timeout_at(deadline, Payload::validate(job.kind, job.bytes, None)).await {
                     Ok(Ok(payload)) => payload,
                     Ok(Err(error)) => {
+                        drop(job.permit);
                         engine.model().finish_send(peer, &error.to_string());
                         continue;
                     }
@@ -157,17 +158,19 @@ pub(super) async fn run(
                     .as_ref()
                     .is_some_and(|flow| flow.id == id && flow.awaiting_ack) =>
             {
-                engine.model().finish_send(peer, "Delivered.");
-                upload = None;
+                if let Some(flow) = upload.take() {
+                    drop(flow._permit);
+                    engine.delivered(peer, flow.payload);
+                }
                 continue;
             }
             SessionEvent::PeerError { id: Some(id), .. }
                 if upload.as_ref().is_some_and(|flow| flow.id == id) =>
             {
+                upload = None;
                 engine
                     .model()
                     .finish_send(peer, "The peer rejected the transfer.");
-                upload = None;
                 continue;
             }
             _ => return,

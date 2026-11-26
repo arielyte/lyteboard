@@ -4,7 +4,7 @@ use std::{fmt, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::peer::{Media, NoiseKey};
+use crate::peer::{Media, NoiseKey, TransferId};
 
 pub const MAX_TEST_TEXT_BYTES: usize = 512;
 pub const DEVICES_PER_PAGE: usize = 4;
@@ -64,6 +64,10 @@ pub enum Command {
     BulkDownload {
         offset: usize,
     },
+    LatestReceived,
+    BulkDownloadReceived {
+        id: TransferId,
+    },
     Received {
         offset: usize,
     },
@@ -109,6 +113,7 @@ pub enum Reply {
     NoBulkItem,
     Delivery(Delivery),
     Received(Option<Message>),
+    LatestReceived(Option<ReceivedItem>),
     ClipboardAuto {
         enabled: bool,
         last_error: Option<String>,
@@ -125,6 +130,14 @@ pub enum Reply {
         entries: Vec<HistoryEntry>,
         more: bool,
     },
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceivedItem {
+    pub id: TransferId,
+    pub peer: NoiseKey,
+    pub media: Media,
+    pub size: u32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
