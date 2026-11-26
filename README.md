@@ -17,6 +17,10 @@ The Linux desktop window and CLI use the same daemon to pair devices and share e
 | `contrib/systemd/` | Optional systemd user unit |
 | `docs/` | Architecture, platform requirements, and tooling decisions |
 
+## Install on Linux
+
+Run `python3 scripts/install-linux.py install` from this repository in your graphical session. It builds release binaries and installs a searchable KDE launcher for your user. Use the same command to upgrade. See [installation, upgrade, and removal](docs/linux-install.md) for prerequisites, CLI-only installation, and exact paths.
+
 ## Build and run
 
 Install [rustup](https://rustup.rs/) and [Node.js 24 LTS](https://nodejs.org/en/about/previous-releases). Rust is pinned in `rust-toolchain.toml`. The headless packages need only the Rust toolchain and a platform linker. Desktop development also needs Tauri's system dependencies, including GTK 3 and WebKitGTK 4.1 on Linux or the MSVC build tools and WebView2 on Windows. Use the package list for your distribution. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)

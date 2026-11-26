@@ -412,6 +412,9 @@ def exercise(root, cleanup, args):
         cleanup.callback(device.stop)
     window = Window(args, alpha.env, cleanup)
     window = daemon_lifecycle(cleanup, args, window, alpha)
+    if args.lifecycle_only:
+        window.close()
+        return
 
     for device in (beta, gamma):
         device.start()
@@ -572,14 +575,16 @@ def main():
     parser.add_argument("--binary", default="target/release/lyteboard-desktop")
     parser.add_argument("--lan-ip", default="127.0.0.1", help="use an on-link IPv4 address to also test real mDNS")
     parser.add_argument("--screenshots", type=Path)
+    parser.add_argument("--lifecycle-only", action="store_true", help="only verify daemon and desktop lifecycle")
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="lyteboard-desktop-"))
     try:
         with ExitStack() as cleanup:
             exercise(root, cleanup, args)
-            errors = root / "errors"
-            errors.mkdir()
-            startup_errors(errors, cleanup, args)
+            if not args.lifecycle_only:
+                errors = root / "errors"
+                errors.mkdir()
+                startup_errors(errors, cleanup, args)
     finally:
         # On shutdown KWin can finish writing its output configuration after the session wrapper exits.
         for attempt in range(5):

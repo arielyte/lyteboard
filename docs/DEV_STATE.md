@@ -236,42 +236,7 @@ The foreground device view refreshes on focus and at five-second intervals while
 
 ### Install and remove on Linux
 
-The release desktop binary expects `lyteboardd` in the same directory. CLI-only users can install just `lyteboard` and `lyteboardd`. From the repository root, build the two command-line binaries and install them into your user bin directory.
-
-```bash
-cargo build --locked --release -p lyteboard-cli -p lyteboard-daemon
-bin="$HOME/.local/bin"
-install -Dm755 target/release/lyteboard "$bin/lyteboard"
-install -Dm755 target/release/lyteboardd "$bin/lyteboardd"
-```
-
-For the GUI, install the desktop dependencies listed in the README and the `desktop-file-utils` package. Build the native window and install its launcher and icon. The launcher uses the executable's absolute path, so the graphical session can open Lyteboard from its application menu.
-
-```bash
-npm --prefix apps/desktop ci
-npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
-bin="$HOME/.local/bin"
-data="${XDG_DATA_HOME:-$HOME/.local/share}"
-install -Dm755 target/release/lyteboard-desktop "$bin/lyteboard-desktop"
-install -Dm644 apps/desktop/src-tauri/icons/icon.png \
-  "$data/icons/hicolor/256x256/apps/io.github.arielyte.lyteboard.png"
-mkdir -p "$data/applications"
-desktop-file-install --dir="$data/applications" \
-  --set-key=Exec --set-value="\"$bin/lyteboard-desktop\"" \
-  --set-key=TryExec --set-value="$bin/lyteboard-desktop" \
-  contrib/desktop/io.github.arielyte.lyteboard.desktop
-```
-
-To remove the GUI, disable **Open Lyteboard at login** in Settings, quit the GUI, then remove its executable, launcher, and icon.
-
-```bash
-data="${XDG_DATA_HOME:-$HOME/.local/share}"
-rm -- "$HOME/.local/bin/lyteboard-desktop" \
-  "$data/applications/io.github.arielyte.lyteboard.desktop" \
-  "$data/icons/hicolor/256x256/apps/io.github.arielyte.lyteboard.png"
-```
-
-To remove the CLI-only installation, stop the daemon with `~/.local/bin/lyteboard daemon stop` if it is running and remove `~/.local/bin/lyteboard` and `~/.local/bin/lyteboardd`. These steps preserve your profile, clipboard history, and saved settings. If you previously installed the optional systemd user unit, follow the explicit removal steps in the [daemon guide](daemon.md).
+Use the [local Linux installation guide](linux-install.md) and the LAN-6F installer below. It supersedes the manual binary-copy instructions from this checkpoint.
 
 ### Verification
 
@@ -435,7 +400,59 @@ PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py --kwin --x1
 git diff --check
 ```
 
-All 87 workspace tests and focused Clippy passed. The simulated clipboard harness and the KWin Wayland and XWayland runs passed. The optional PyQt6 check pasted PNG, JPEG-derived PNG, and WebP-derived PNG into an image-capable Qt rich-text editor and checked the inserted image dimensions. The harness also verified byte-for-byte original JPEG and WebP history and resending, history restore as PNG, and suppression of an XWayland echo. A separate synthetic oversized conversion produced an explicit error on both automatic and manual application and preserved the previous clipboard and retained JPEG. The updated build was not retested in ChatGPT.
+All 87 workspace tests and focused Clippy passed. The simulated clipboard harness and the KWin Wayland and XWayland runs passed. The optional PyQt6 check pasted PNG, JPEG-derived PNG, and WebP-derived PNG into an image-capable Qt rich-text editor and checked the inserted image dimensions. The harness also verified byte-for-byte original JPEG and WebP history and resending, history restore as PNG, and suppression of an XWayland echo. A separate synthetic oversized conversion produced an explicit error on both automatic and manual application and preserved the previous clipboard and retained JPEG. The user subsequently confirmed physical LAN-6E acceptance: Samsung images received on CachyOS KDE Wayland can be copied and pasted directly into ChatGPT.
+
+## LAN-6F checkpoint
+
+LAN-6E passed user-reported physical acceptance: images received from Samsung Android on CachyOS KDE Wayland can now be copied and pasted directly into ChatGPT. No clipboard, protocol, or Android changes were needed for LAN-6F.
+
+The Linux release is installed for the current user under `~/.local/lib/lyteboard/bin`, with shell symlinks in `~/.local/bin`. Its frontend is embedded. The installed GUI and CLI start the installed sibling daemon through the existing authenticated IPC lifecycle and single-instance locks. Normal application use does not require the repository, a terminal, or development tools.
+
+`scripts/install-linux.py` builds all three release binaries, stages them, installs the existing icon and an absolute-path desktop entry, and refreshes available desktop/KDE caches. The GTK program name matches the desktop entry ID, so KDE can associate windows with the launcher without introducing a session-wide GTK singleton that would break separate development profiles. The first GUI installation enables **Start daemon when Lyteboard opens**. Upgrades preserve later explicit settings. Login autostart remains independently opt-in. Closing the window leaves the daemon running. No system service is installed or enabled.
+
+Upgrade closes this installed GUI, stops the current daemon through authenticated IPC, waits for process exit, replaces binaries while holding the existing runtime locks, and restarts components that were running. An active optional standard systemd user service is managed through `systemctl --user`, with PID and executable checks. Other active runtime profiles using the installed binaries must be stopped first. Uninstall removes installed artifacts and managed login autostart, while retaining credentials, identity, trusted devices, history, and preferences. [Installation guide](linux-install.md)
+
+### Exact installation, upgrade, and removal
+
+Run install/upgrade from the repository in the normal graphical login session, without sudo:
+
+```sh
+# First installation, or upgrade (builds native releases).
+python3 scripts/install-linux.py install
+# Reuse native release artifacts already built from this revision.
+python3 scripts/install-linux.py install --skip-build
+# A new CLI-only installation, without a GUI launcher.
+python3 scripts/install-linux.py install --cli-only
+# Removal from any directory; user data is preserved.
+python3 "$HOME/.local/lib/lyteboard/install-linux.py" uninstall
+```
+
+Search **Lyteboard** in KDE's launcher, then add it to Favorites or pin it to the task manager. If the shell cannot find `lyteboard`, add `~/.local/bin` to its PATH as described in the guide. GUI launch uses an absolute path.
+
+### Focused verification
+
+```sh
+cargo build --locked --release -p lyteboard-daemon -p lyteboard-cli
+npm --prefix apps/desktop run tauri build -- --no-bundle --ci -- --locked
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_install_linux.py
+cargo test --locked -p lyteboard-desktop desktop_preferences::
+cargo clippy --locked -p lyteboard-desktop --bin lyteboard-desktop -- -D warnings
+cargo fmt --all -- --check
+desktop-file-validate contrib/desktop/io.github.arielyte.lyteboard.desktop
+PYTHONDONTWRITEBYTECODE=1 python3 apps/desktop/tests/desktop_gui.py \
+  --lifecycle-only --binary "$HOME/.local/lib/lyteboard/bin/lyteboard-desktop" \
+  --driver /tmp/lyteboard-lan6d-drivers/bin/tauri-driver \
+  --webkit-driver /tmp/lyteboard-lan6d-drivers/usr/bin/WebKitWebDriver
+git diff --check
+```
+
+The three installer tests passed: real release installation, authenticated daemon upgrades, duplicate starts, CLI-only install, another active profile blocking replacement, missing artifacts, managed login-entry updates, preference preservation, and repeated data-preserving uninstall. Systemd profile/executable checks were simulated; no user service was installed or enabled. The focused desktop-preference Rust test, Clippy, formatting, desktop validation, frontend typecheck/Vite production build, and native release build passed. Sandbox restrictions initially prevented private-path/socket tests; they passed outside the sandbox.
+
+**Actual KDE Wayland verification:** the installed desktop entry opened the release with `/usr/bin:/bin` as PATH and `/tmp` as the working directory. Starting from an offline daemon brought up the installed release daemon and authenticated IPC. Closing the native KDE window left `ping` successful. Reopening worked. Live upgrades changed both installed GUI and daemon PIDs, removed the old processes, and preserved five existing profile/settings files byte-for-byte. Repeated launches retained a single GUI and daemon. KDE reported `desktopFileName=io.github.arielyte.lyteboard`; the launcher and icon are registered. The installed CLI was already on the user's PATH. Login autostart remained off.
+
+The focused native WebDriver run also passed start/stop/restart, concurrent daemon starts, saved GUI startup preference, login opt-in toggling, and close/reopen behavior using the installed GUI in an isolated nested KWin session. The normal installed GUI remained open in the primary session, verifying independent runtime profiles. Isolated portal/accessibility services emitted advisory warnings without test failures.
+
+Limitations: installation is per-user and local, without distribution packages. Finish active transfers before upgrade; daemon restart discards ephemeral received items while persistent data survives. If interrupted during binary replacement, rerun installation before opening the GUI. Login/logout startup and a real active systemd-service upgrade were not exercised. Earlier manual binary copies must be moved aside before creating the managed shell symlinks. The installer leaves small lock files/empty directories after removal. Full unrelated regressions were not repeated.
 
 ## Manual two-daemon demonstration
 

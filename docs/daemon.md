@@ -2,6 +2,8 @@
 
 The CLI and desktop window communicate with the same daemon. The GUI checks status on launch, while focused, and on manual refresh. Closing the window leaves the daemon running.
 
+For normal desktop use, follow the [per-user installation guide](linux-install.md). The GUI starts the daemon when opened; login startup remains optional.
+
 ## Run without systemd
 
 Build both binaries from the repository root:
@@ -21,12 +23,10 @@ All three processes need the same `XDG_RUNTIME_DIR`. A normal Linux desktop logi
 
 ## Install the optional systemd user service
 
-Stop any manually started daemon first. The supplied unit expects `lyteboardd` at `~/.local/bin/lyteboardd`. From the repository root:
+For an existing desktop installation, keep its installed binaries and omit the CLI-only install command below. Stop any manually started daemon first. The supplied unit expects `lyteboardd` at `~/.local/bin/lyteboardd`. From the repository root:
 
 ```sh
-cargo build --locked --release -p lyteboard-cli -p lyteboard-daemon
-install -Dm755 target/release/lyteboardd "$HOME/.local/bin/lyteboardd"
-install -Dm755 target/release/lyteboard "$HOME/.local/bin/lyteboard"
+python3 scripts/install-linux.py install --cli-only
 install -Dm644 contrib/systemd/lyteboardd.service \
   "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/lyteboardd.service"
 systemctl --user daemon-reload

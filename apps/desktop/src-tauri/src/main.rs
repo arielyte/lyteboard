@@ -18,6 +18,9 @@ use lifecycle::*;
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Match the installed desktop entry on Wayland without registering a global
+    // GTK application singleton: development runtime profiles stay independent.
+    gtk::glib::set_prgname(Some("io.github.arielyte.lyteboard"));
     let instance = match instance::Instance::claim() {
         Ok(Some(instance)) => Some(instance),
         Ok(None) => return Ok(()),

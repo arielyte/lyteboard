@@ -5,5 +5,6 @@ Comment=Share clipboard content with paired devices on your local network
 Exec=lyteboard-desktop
 Icon=io.github.arielyte.lyteboard
 Terminal=false
+StartupWMClass=io.github.arielyte.lyteboard
 Categories=Utility;
 Keywords=clipboard;LAN;
