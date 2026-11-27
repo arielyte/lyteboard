@@ -9,7 +9,7 @@ use std::{
 };
 
 use lyteboard_core::bulk::{Payload, validate_size};
-use lyteboard_core::ipc::linux::{
+use lyteboard_core::ipc::local::{
     BULK_TIMEOUT, Endpoint, EndpointError, FrameError, REQUEST_TIMEOUT, ServerSocket, authenticate,
     read_bulk, receive, send, write_bulk,
 };
@@ -22,8 +22,6 @@ use lyteboard_protocol::{
 };
 use thiserror::Error;
 use tokio::{
-    net::UnixStream,
-    signal::unix::{SignalKind, signal},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
@@ -33,6 +31,14 @@ use crate::{
     history::{History, Operation as HistoryOperation},
     network::{Network, profile_path},
     preferences::{HistorySettings, Preferences},
+};
+
+#[cfg(target_os = "windows")]
+use lyteboard_core::ipc::windows::LocalStream;
+#[cfg(target_os = "linux")]
+use tokio::{
+    net::UnixStream as LocalStream,
+    signal::unix::{SignalKind, signal},
 };
 
 const MAX_CLIENTS: usize = 32;
@@ -45,6 +51,7 @@ pub enum DaemonError {
     History(#[source] io::Error),
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
+    #[cfg(target_os = "linux")]
     #[error("could not register signal handlers: {0}")]
     Signals(#[source] io::Error),
     #[error("could not accept a local client: {0}")]
@@ -53,8 +60,22 @@ pub enum DaemonError {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn run() -> Result<(), DaemonError> {
+    #[cfg(target_os = "linux")]
     let mut interrupt = signal(SignalKind::interrupt()).map_err(DaemonError::Signals)?;
+    #[cfg(target_os = "linux")]
     let mut terminate = signal(SignalKind::terminate()).map_err(DaemonError::Signals)?;
+    #[cfg(target_os = "linux")]
+    let shutdown = async move {
+        tokio::select! { _ = interrupt.recv() => (), _ = terminate.recv() => () }
+    };
+    #[cfg(target_os = "windows")]
+    let shutdown = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // A detached per-user daemon may have no console. IPC shutdown still works.
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(shutdown);
     let endpoint = Endpoint::from_env()?;
     let server = ServerSocket::bind(&endpoint).await?;
     let profile = profile_path();
@@ -72,8 +93,7 @@ pub async fn run() -> Result<(), DaemonError> {
     let shutdown_client = loop {
         tokio::select! {
             biased;
-            _ = interrupt.recv() => break None,
-            _ = terminate.recv() => break None,
+            _ = &mut shutdown => break None,
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
                 match result {
                     Ok(Some(stream)) => break Some(stream),
@@ -110,13 +130,13 @@ pub async fn run() -> Result<(), DaemonError> {
 }
 
 async fn handle(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     started: Instant,
     connections_accepted: Arc<AtomicU64>,
     network: Network,
     history: History,
     bulk_slots: Arc<Semaphore>,
-) -> Option<UnixStream> {
+) -> Option<LocalStream> {
     let response = match timeout(REQUEST_TIMEOUT, receive::<Request>(&mut stream)).await {
         Ok(Ok(Request::Ping)) => Response::Pong,
         Ok(Ok(Request::GetStatus)) => Response::Status(Status {
@@ -280,7 +300,7 @@ async fn handle(
 }
 
 async fn upload(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     network: &Network,
     peers: Vec<String>,
     media: Media,

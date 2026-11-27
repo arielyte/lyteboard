@@ -234,6 +234,15 @@ pub async fn thumbnail(
     .map_err(|_| Error::Validation)?
 }
 
+/// Windows local bulk downloads retain the original validated representation.
+/// The Windows clipboard adapter remains unavailable in LAN-7A.
+#[cfg(target_os = "windows")]
+pub async fn clipboard_payload(
+    original: std::sync::Arc<Payload>,
+) -> Result<std::sync::Arc<Payload>, Error> {
+    Ok(original)
+}
+
 /// Prepare a separate local clipboard representation of a validated payload.
 #[cfg(target_os = "linux")]
 pub async fn clipboard_payload(

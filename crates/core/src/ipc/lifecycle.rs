@@ -13,7 +13,7 @@ use tokio::{
     time::{Instant, sleep, timeout_at},
 };
 
-use super::{Client, ClientError, linux::EndpointError};
+use super::{Client, ClientError, local::EndpointError};
 
 const START_TIMEOUT: Duration = Duration::from_secs(4);
 const RETRY: Duration = Duration::from_millis(50);
@@ -67,11 +67,19 @@ impl Client {
             return Ok(StartOutcome::AlreadyRunning);
         }
 
+        #[cfg(target_os = "windows")]
+        let daemon_name = "lyteboardd.exe";
+        #[cfg(target_os = "linux")]
+        let daemon_name = "lyteboardd";
         let path = env::current_exe()
             .map_err(StartError::Executable)?
-            .with_file_name("lyteboardd");
-        let mut child = Command::new(&path)
-            .process_group(0)
+            .with_file_name(daemon_name);
+        let mut command = Command::new(&path);
+        #[cfg(target_os = "linux")]
+        command.process_group(0);
+        #[cfg(target_os = "windows")]
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

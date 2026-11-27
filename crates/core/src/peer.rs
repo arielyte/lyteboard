@@ -5,7 +5,7 @@ mod identity;
 pub mod lan;
 mod pairing;
 mod session;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 pub mod storage;
 mod trust;
 
@@ -41,7 +41,7 @@ pub enum Error {
     Wire(#[from] WireError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     #[error(transparent)]
     Storage(#[from] storage::StorageError),
     #[error("operating system random source unavailable")]

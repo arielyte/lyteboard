@@ -1,6 +1,6 @@
 # Lyteboard development handoff
 
-Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and Linux CLI and daemon. The Kotlin Android companion pairs with Linux and shares foreground clipboard content, text, and images. Windows support is future work.
+Lyteboard is a LAN-only clipboard-sharing project with a shared Rust core, Tauri + React desktop GUI, and native Linux/Windows CLI and daemon. The Kotlin Android companion pairs with Linux and shares foreground clipboard content, text, and images. Windows has the LAN-7A platform foundation; native Windows runtime acceptance remains pending.
 
 ## LAN-1 checkpoint
 
@@ -454,6 +454,79 @@ The focused native WebDriver run also passed start/stop/restart, concurrent daem
 
 Limitations: installation is per-user and local, without distribution packages. Finish active transfers before upgrade; daemon restart discards ephemeral received items while persistent data survives. If interrupted during binary replacement, rerun installation before opening the GUI. Login/logout startup and a real active systemd-service upgrade were not exercised. Earlier manual binary copies must be moved aside before creating the managed shell symlinks. The installer leaves small lock files/empty directories after removal. Full unrelated regressions were not repeated.
 
+## LAN-7A checkpoint — Windows platform foundation
+
+LAN-6F remains complete. Linux is locally installed and operational, and the user has verified physical Linux/Android interoperability. LAN-7A adds native Windows daemon, CLI, and Tauri entry points using the same Rust LAN worker, TCP/Noise sessions, explicit pairing approvals, persistent trust/revocation, mDNS discovery/reconnection, bounded transfers, and SQLite history. The LAN wire protocol is unchanged.
+
+### Windows implementation and security boundaries
+
+- `crates/windows` contains the Windows FFI behind safe APIs. Other application crates retain their existing unsafe-code prohibition. `ipc::local` selects Unix sockets or Tokio byte-mode named pipes; bounded framing, decoding, request validation, client operations, daemon handlers, worker queues, and timeouts are shared. The 4 KiB control-frame limit, 32-client cap, two local bulk slots, and 20-second bulk deadline remain. Windows local binary streams end with one zero byte after the announced bounded payload; Unix keeps its half-close. Windows bulk downloads preserve the original validated media and bytes.
+- The daemon runs as the launching user, without a Windows service or administrator privileges. CLI/GUI lifecycle launches the sibling `lyteboardd.exe` directly with `CREATE_NO_WINDOW`, serializes launches, and checks readiness through authenticated IPC. Authenticated shutdown releases the listener and daemon lock before acknowledging. Console Ctrl+C is supported when a console exists; IPC shutdown also works without a console.
+- Runtime, profile, preferences, and history use the current user's LocalAppData Known Folder, normally `%LOCALAPPDATA%\Lyteboard`, with `runtime`, `profile`, and `settings` subdirectories. `LYTEBOARD_RUNTIME_DIR` and `LYTEBOARD_PROFILE` provide absolute local development/test overrides. Network/UNC paths, parent traversal, reparse points, non-private final objects, and hardlinked data/lock files are rejected. Directory handles deny delete-sharing and hold ancestors stable while persistent stores are open. Atomic replacement flushes a private temporary file and uses `MoveFileExW` with replacement and write-through flags. SQLite sidecars inherit the private history directory ACL; history remains opt-in and **unencrypted at rest**.
+- Each created directory/file has an explicit user-SID owner and protected DACL granting full access only to that user; directories propagate this grant to children. Existing final objects are checked by handle for owner, every access grant, type, and links. Final directories also require a protected DACL and both child-inheritance flags, so a parent cannot broaden access later and SQLite sidecars inherit only the user grant. Secure exclusive file locks enforce daemon, launcher, profile, history, preferences, and GUI instances. Windows GUI duplicates exit; bringing an existing window forward is deferred. Lock failures fail closed on Windows.
+- Pipe names include the user SID and a hash of the canonical runtime directory. Creation supplies an explicit user-only security descriptor, `FILE_FLAG_FIRST_PIPE_INSTANCE` for the initial instance, and `PIPE_REJECT_REMOTE_CLIENTS` on every instance. A replacement listening instance exists before dispatching a client, retaining ownership of the pipe name. Both ends validate the kernel-reported peer PID's process-token user SID against the current user before exchanging requests. Client opens use identification-only security QoS to prevent the server from impersonating them. Other users, unknown peers, and pipe-name squatting fail closed. Processes already running as the same user remain in the local trust boundary. [Microsoft named-pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights), [remote-client rejection](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew)
+- Identity seeds are encrypted by current-user DPAPI with UI forbidden and saved only as `identity.dpapi` in the private profile. Plaintext and decrypted buffers are zeroized. No machine-wide protection or plaintext fallback exists. Missing credentials on an existing profile, corrupt ciphertext, and DPAPI failures return errors without generating replacement keys. Public identity metadata and trust retain their existing formats and identity binding. [Microsoft DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata)
+- Windows clipboard operations deliberately return an unavailable error. Tray behavior and login startup are unavailable. Clipboard conversion/monitoring, GTK, Secret Service, Unix filesystem calls, and Unix signal handlers stay behind platform boundaries. No firewall changes, cloud infrastructure, installer, or packaging were introduced.
+
+### Native Windows commands (PowerShell, normal user)
+
+Use Rust/MSVC with the Windows SDK and C++ build tools, Node/npm, and WebView2 for the desktop. These are development build dependencies, not an elevation requirement for running Lyteboard. From the repository root:
+
+```powershell
+cargo build --locked -p lyteboard-daemon -p lyteboard-cli
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run tauri build -- --debug --no-bundle --ci -- --locked
+.\target\debug\lyteboard.exe daemon start
+.\target\debug\lyteboard.exe ping
+.\target\debug\lyteboard.exe status
+.\target\debug\lyteboard.exe version
+.\target\debug\lyteboard.exe network status
+.\target\debug\lyteboard.exe daemon stop
+.\target\debug\lyteboard-desktop.exe
+```
+
+CLI `--version` and daemon `--version` report their local build versions; CLI `version` queries the running daemon. The GUI can start/stop the daemon, configure the listener/discovery, pair/manage devices, and inspect/manage history. Clipboard sends/copies/restores are deferred. Closing the GUI leaves the daemon running. The listener still defaults to `127.0.0.1:0`; configure the device's actual on-link address for physical pairing. Windows firewall policy can block LAN TCP or mDNS: this milestone never adds rules automatically.
+
+### Verification and current evidence
+
+**Passed locally on Linux:**
+
+```sh
+cargo build --locked -p lyteboard-cli -p lyteboard-daemon
+cargo test --locked -p lyteboard-core -p lyteboard-daemon -p lyteboard-protocol -p lyteboard-desktop
+cargo clippy --locked -p lyteboard-core -p lyteboard-daemon -p lyteboard-cli -p lyteboard-desktop --all-targets -- -D warnings
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/lan_cli.py
+PYTHONDONTWRITEBYTECODE=1 python3 apps/daemon/tests/clipboard_cli.py
+cargo check --locked --target aarch64-linux-android -p lyteboard-core -p lyteboard-android
+cargo fmt --all -- --check
+git diff --check
+```
+
+All 87 affected Rust tests passed. The LAN harness passed pairing, authenticated delivery, trust persistence, changed-address reconnection, wrong-pin rejection, revocation, and shutdown. The simulated Wayland/X11 clipboard harness passed bulk limits, images, interrupted/excess IPC streams, manual/automatic application, and related history behavior. Socket/private-path tests required running outside the filesystem/network sandbox. Android's Rust core and UniFFI bridge type-checked for the existing ARM64 Android target; Android APK/hardware and graphical Linux acceptance were not repeated.
+
+**Windows compilation checks passed on Linux**, using the installed Rust `x86_64-pc-windows-gnu` target and temporary MinGW headers/runtime/binutils plus a Clang compiler wrapper under `/tmp/lyteboard-lan7-cross`:
+
+```sh
+PATH="/tmp/lyteboard-lan7-cross/bin:/tmp/lyteboard-lan7-cross/usr/bin:$PATH" \
+  cargo check --locked --target x86_64-pc-windows-gnu --all-targets \
+  -p lyteboard-core -p lyteboard-cli -p lyteboard-daemon -p lyteboard-desktop -p lyteboard-windows
+PATH="/tmp/lyteboard-lan7-cross/bin:/tmp/lyteboard-lan7-cross/usr/bin:$PATH" \
+  cargo clippy --locked --target x86_64-pc-windows-gnu --all-targets \
+  -p lyteboard-core -p lyteboard-cli -p lyteboard-daemon -p lyteboard-desktop -p lyteboard-windows -- -D warnings
+```
+
+The Windows workspace also passed the same Clippy check with `--workspace --all-targets`, including the Android host crate. These compile/type-check application and test sources, including Windows FFI and bundled SQLite; they do **not** execute Windows code or establish a native MSVC build result. No Windows device is connected and no Windows runtime/Wine is available locally.
+
+The existing `windows-2025` CI matrix now exercises the real Windows entry points through its workspace Clippy/tests/build and embedded-frontend desktop build, then runs `python apps/daemon/tests/windows_cli.py`. New Windows-only Rust tests cover DPAPI round-trip/tamper failure; user-only versus NULL DACLs; hardlinks/path traversal; named-pipe first-instance and peer-SID checks; durable identity and missing/corrupt credential rejection; live daemon lifecycle, duplicate starts, malformed/oversized frames, stalled clients, shutdown and restart. The Python harness covers concurrent sibling-daemon launchers, two-daemon Noise pairing and bidirectional text, binary-pipe bulk upload, exact persisted history bytes, identity/trust across restart, clipboard unavailability, and revocation. Native invocation:
+
+```powershell
+cargo test --locked --workspace
+cargo build --locked --workspace
+python apps/daemon/tests/windows_cli.py
+```
+
+**Native Windows runtime verification is pending.** The added CI checks have not been executed from this uncommitted workspace. Actual different-account access denial, remote SMB pipe rejection, Windows desktop rendering/lifecycle, physical Windows/Linux/Android transfers, multicast discovery, and behavior under real Windows firewall policy still require Windows acceptance. ACL/security checks type-check but have not run here. Device identity recovery requires the original Windows user's DPAPI credentials/profile; copying ciphertext alone is not a portable identity backup. Existing same-user processes, administrators, and compromised sessions are outside the local protection boundary. No commit or push was performed.
+
 ## Manual two-daemon demonstration
 
 Run from the repository root on Linux. The demonstration uses GNOME Keyring in a disposable D-Bus session. Choose free loopback ports if either example port is occupied.
@@ -646,4 +719,4 @@ cargo test --locked --workspace
 
 ## Remaining work
 
-Daemon integration and service advertisement are Linux-only. Binding to a new local IP after DHCP or interface changes still requires changing the listener or restarting the daemon with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use the paired device’s manual address for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails.
+Daemon integration and service advertisement are shared by Linux and Windows; Windows runtime and physical interoperability acceptance remain pending (see LAN-7A). Binding to a new local IP after DHCP or interface changes still requires changing the listener or restarting the daemon with the updated `LYTEBOARD_LISTEN_ADDR`. Multicast can be blocked by the LAN. Use the paired device’s manual address for a current on-link fallback. Scoped IPv6 link-local addresses are outside the current wire format. Connection status follows confirmed TCP sessions and can lag a silent link failure until keepalive detects it. Image MIME availability depends on the source application and clipboard owner. Animated images and file lists are outside the supported formats. Bulk transfers need LAN-4B at both endpoints. The desktop clipboard manager can retain a copy independently. Restart the daemon from the graphical session if automatic clipboard access fails.

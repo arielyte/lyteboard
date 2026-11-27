@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap.workspace = true
 lyteboard-core.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 lyteboard-protocol.workspace = true
 mdns-sd = { version = "0.22", default-features = false, features = ["async"] }
 getrandom = "0.4.3"
@@ -26,11 +26,13 @@ hex = "0.4"
 if-addrs = "0.15"
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 serde.workspace = true
-rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 zeroize = "1"
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["io-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["fs"] }

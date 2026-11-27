@@ -2546,6 +2546,7 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "lyteboard-protocol",
+ "lyteboard-windows",
  "rustix",
  "secret-service",
  "serde",
@@ -2609,6 +2610,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "lyteboard-windows"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -19,7 +19,7 @@ clap.workspace = true
 lyteboard-core.workspace = true
 thiserror.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 tokio = { workspace = true, features = ["time"] }
 hex = "0.4"
 zeroize = "1"

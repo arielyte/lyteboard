@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use lyteboard_protocol::peer::{NoiseKey, RouteId};
 
 use super::Error;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 use super::storage::{StorageError, TrustFile};
 
 pub(super) const MAX_ACTIVE: usize = 32;
@@ -20,9 +20,9 @@ pub struct TrustedDevice {
 #[derive(Default)]
 pub(super) struct Registry {
     records: Vec<(TrustedDevice, Status)>,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     file: Option<TrustFile>,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     uncertain: bool,
 }
 
@@ -34,7 +34,7 @@ pub(super) enum Status {
 }
 
 impl Registry {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
     pub(super) fn persistent(file: TrustFile, records: Vec<(TrustedDevice, Status)>) -> Self {
         Self {
             records,
@@ -44,7 +44,7 @@ impl Registry {
     }
 
     pub(super) fn ensure_available(&self) -> Result<(), Error> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
         if self.uncertain {
             return Err(StorageError::WriteUncertain.into());
         }
@@ -157,7 +157,7 @@ impl Registry {
         &mut self,
         update: impl FnOnce(&mut Vec<(TrustedDevice, Status)>),
     ) -> Result<(), Error> {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
         if let Some(file) = &self.file {
             let mut next = self.records.clone();
             update(&mut next);

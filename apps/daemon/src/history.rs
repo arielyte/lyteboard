@@ -24,6 +24,7 @@ use lyteboard_protocol::{
     peer::{MAX_BULK_TEXT_BYTES, MAX_IMAGE_BYTES, Media, NoiseKey},
 };
 use rusqlite::{Connection, Error, OpenFlags, OptionalExtension, Transaction, params};
+#[cfg(target_os = "linux")]
 use rustix::{
     fs::{Mode, OFlags, openat},
     io::Errno,
@@ -107,7 +108,7 @@ impl History {
 
     pub(super) async fn control(&self, operation: Operation) -> Reply {
         match timeout(
-            lyteboard_core::ipc::linux::REQUEST_TIMEOUT - Duration::from_millis(250),
+            lyteboard_core::ipc::local::REQUEST_TIMEOUT - Duration::from_millis(250),
             self.dispatch(operation),
         )
         .await
@@ -335,9 +336,12 @@ struct Store {
     db: Connection,
     limits: HistoryLimits,
     _lock: File,
+    #[cfg(target_os = "windows")]
+    _directory: lyteboard_core::windows::PrivateDir,
 }
 
 impl Store {
+    #[cfg(target_os = "linux")]
     fn open(profile: &Path, limits: HistoryLimits) -> Result<Self> {
         let path = profile.join("history");
         let dir = open_private_dir(profile)
@@ -388,6 +392,46 @@ impl Store {
         Self::prune(&tx, limits, now()).map_err(|_| UNAVAILABLE)?;
         tx.commit().map_err(|_| UNAVAILABLE)?;
         dir.sync_all().map_err(|_| UNAVAILABLE)?;
+        Ok(store)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn open(profile: &Path, limits: HistoryLimits) -> Result<Self> {
+        let _profile = open_private_dir(profile).map_err(|_| UNAVAILABLE)?;
+        let dir = open_private_dir(&profile.join("history")).map_err(|_| UNAVAILABLE)?;
+        let lock = lock_named(&dir, "history.lock").map_err(|_| UNAVAILABLE)?;
+        let new = match dir.open_file(DB, false) {
+            Ok(file) => {
+                check_private_file(&file).map_err(|_| UNAVAILABLE)?;
+                false
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                dir.open_file(DB, true).map_err(|_| UNAVAILABLE)?;
+                true
+            }
+            Err(_) => return Err(UNAVAILABLE.into()),
+        };
+        for name in [
+            "history.sqlite3-journal",
+            "history.sqlite3-wal",
+            "history.sqlite3-shm",
+        ] {
+            match dir.open_file(name, false) {
+                Ok(file) => check_private_file(&file).map_err(|_| UNAVAILABLE)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return Err(UNAVAILABLE.into()),
+            }
+        }
+        let db = Self::connect(&dir.path().join(DB), new).map_err(|_| UNAVAILABLE)?;
+        let mut store = Self {
+            db,
+            limits,
+            _lock: lock,
+            _directory: dir,
+        };
+        let tx = store.db.transaction().map_err(|_| UNAVAILABLE)?;
+        Self::prune(&tx, limits, now()).map_err(|_| UNAVAILABLE)?;
+        tx.commit().map_err(|_| UNAVAILABLE)?;
         Ok(store)
     }
 
@@ -631,7 +675,7 @@ fn media(tag: u8) -> rusqlite::Result<Media> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 

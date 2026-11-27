@@ -136,7 +136,7 @@ impl Network {
         }
         match timeout(Duration::from_secs(2), rx).await {
             Ok(Ok(reply)) => Ok(reply),
-            _ => Err("LAN worker is busy. Check the Secret Service session and retry.".into()),
+            _ => Err("LAN worker is busy. Check credential protection and retry.".into()),
         }
     }
 }
@@ -179,6 +179,15 @@ struct PairJob {
 type Shared = Rc<RefCell<Activity>>;
 
 pub(super) fn profile_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    return env::var_os("LYTEBOARD_PROFILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            lyteboard_core::windows::app_data()
+                .ok()
+                .map(|p| p.join("profile"))
+        });
+    #[cfg(target_os = "linux")]
     env::var_os("LYTEBOARD_PROFILE")
         .map(PathBuf::from)
         .or_else(|| {
@@ -933,6 +942,10 @@ async fn approve_pair(
 }
 
 fn storage_error(error: StorageError) -> String {
+    #[cfg(target_os = "windows")]
+    if matches!(error, StorageError::Credential(_)) {
+        return "Windows user-scoped identity protection failed. Restore this profile and its Windows user credentials, or choose a new profile and pair again. No replacement key was generated.".into();
+    }
     match error {
         StorageError::Credential(CredentialError::Locked) =>
             "Secret Service is locked. Unlock your desktop keyring and retry.".into(),

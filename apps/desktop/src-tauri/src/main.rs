@@ -1,32 +1,36 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod desktop;
-#[cfg(target_os = "linux")]
+#[cfg_attr(target_os = "windows", path = "desktop_preferences_windows.rs")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod desktop_preferences;
-#[cfg(target_os = "linux")]
+#[cfg_attr(target_os = "windows", path = "instance_windows.rs")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod instance;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod lifecycle;
 #[cfg(target_os = "linux")]
 mod tray;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use desktop::*;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use lifecycle::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Match the installed desktop entry on Wayland without registering a global
     // GTK application singleton: development runtime profiles stay independent.
+    #[cfg(target_os = "linux")]
     gtk::glib::set_prgname(Some("io.github.arielyte.lyteboard"));
     let instance = match instance::Instance::claim() {
         Ok(Some(instance)) => Some(instance),
         Ok(None) => return Ok(()),
+        #[cfg(target_os = "linux")]
         Err(error)
             if error
-                .downcast_ref::<lyteboard_core::ipc::linux::EndpointError>()
+                .downcast_ref::<lyteboard_core::ipc::local::EndpointError>()
                 .is_some() =>
         {
             None
@@ -81,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn main() {
     eprintln!("The Lyteboard desktop currently runs on Linux.");
 }

@@ -57,7 +57,7 @@ impl Values {
 }
 
 struct Directory {
-    dir: File,
+    dir: lyteboard_core::peer::storage::PrivateDir,
     _lock: File,
 }
 
@@ -144,7 +144,7 @@ impl Preferences {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -1,3 +1,4 @@
+use std::os::unix::fs::MetadataExt;
 use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},

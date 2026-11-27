@@ -2,13 +2,13 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod history;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod network;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod preferences;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod server;
 
 #[derive(Parser)]
@@ -18,16 +18,16 @@ struct Daemon {}
 fn main() -> ExitCode {
     Daemon::parse();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     if let Err(error) = server::run() {
         eprintln!("lyteboardd: {error}");
         return ExitCode::FAILURE;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     return ExitCode::SUCCESS;
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         eprintln!("lyteboardd: the daemon currently runs on Linux");
         ExitCode::FAILURE

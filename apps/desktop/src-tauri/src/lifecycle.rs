@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
 use gtk::prelude::WidgetExt;
 use lyteboard_core::ipc::{Client, ClientError, lifecycle::StartOutcome};
 use serde::Serialize;
@@ -13,7 +14,6 @@ use crate::{
     desktop,
     desktop_preferences::{Preferences, Store},
     instance::Instance,
-    tray,
 };
 
 pub(crate) const CHANGED: &str = "desktop-changed";
@@ -227,6 +227,7 @@ pub(crate) fn show(app: &AppHandle) {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn tray_status(app: &AppHandle, available: bool) {
     let state = app.state::<Desktop>();
     if state.tray_available.swap(available, Ordering::Relaxed) != available {
@@ -251,6 +252,7 @@ pub(crate) fn window_event(window: &tauri::Window, event: &WindowEvent) {
 pub(crate) fn setup(app: &mut App, instance: Option<Instance>) {
     app.manage(Desktop::new());
     let handle = app.handle().clone();
+    #[cfg(target_os = "linux")]
     if let Some(window) = app.get_webview_window("main")
         && let Ok(gtk_window) = window.gtk_window()
     {
@@ -284,5 +286,6 @@ pub(crate) fn setup(app: &mut App, instance: Option<Instance>) {
             }
         });
     }
-    tauri::async_runtime::spawn(tray::run(handle));
+    #[cfg(target_os = "linux")]
+    tauri::async_runtime::spawn(crate::tray::run(handle));
 }

@@ -22,7 +22,7 @@ pub(crate) struct Preferences {
 }
 
 pub(crate) struct Store {
-    directory: File,
+    directory: lyteboard_core::peer::storage::PrivateDir,
     autostart: PathBuf,
     pub choices: Preferences,
 }

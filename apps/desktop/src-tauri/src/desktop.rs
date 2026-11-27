@@ -519,7 +519,7 @@ pub(crate) enum PreviewView {
 
 #[tauri::command]
 pub(crate) async fn history_preview(id: i64) -> Result<PreviewView> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         use base64::{Engine, engine::general_purpose::STANDARD};
         use lyteboard_protocol::peer::Media;
@@ -544,7 +544,7 @@ pub(crate) async fn history_preview(id: i64) -> Result<PreviewView> {
             _ => Err(unexpected()),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = id;
         Err("Clipboard history is currently supported on Linux.".into())

@@ -6,6 +6,7 @@ members = [
     "apps/desktop/src-tauri",
     "crates/core",
     "crates/protocol",
+    "crates/windows",
 ]
 default-members = [
     "apps/cli",

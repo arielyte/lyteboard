@@ -2,13 +2,13 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod clipboard;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod history;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod network;
 
 #[derive(Parser)]
@@ -32,25 +32,25 @@ enum Command {
         command: DaemonCommand,
     },
     /// Inspect or configure direct LAN networking.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Network {
         #[command(subcommand)]
         command: network::NetworkCommand,
     },
     /// Pair with another device.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Pair {
         #[command(subcommand)]
         command: network::PairCommand,
     },
     /// Manage paired devices.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Devices {
         #[command(subcommand)]
         command: network::DeviceCommand,
     },
     /// Send text and wait for an authenticated receipt.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Send {
         #[arg(value_parser = network::parse_key)]
         device: [u8; 32],
@@ -61,19 +61,19 @@ enum Command {
         stdin: bool,
     },
     /// Share or apply Linux clipboard text and images.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Clipboard {
         #[command(subcommand)]
         command: clipboard::ClipboardCommand,
     },
     /// Inspect or reuse opt-in local clipboard history.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     History {
         #[command(subcommand)]
         command: history::HistoryCommand,
     },
     /// Show recent received test messages.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Received {
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=16))]
         limit: u8,
@@ -90,9 +90,9 @@ enum DaemonCommand {
 
 fn main() -> ExitCode {
     let Cli { command } = Cli::parse();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let result = linux::run(command);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let result = {
         let _ = command;
         Err::<(), _>(lyteboard_core::ipc::ClientError::UnsupportedPlatform)
